@@ -15,7 +15,14 @@ Two audiences, deliberately separated into different tabs.
 **Admin — `📦 Inventory` and `⏰ Expiry`**
 
 - Register items and set a minimum stock level (the app flags anything below it).
+  Three ways to supply the barcode: **scan it with the camera** (the default),
+  type it, or generate one. Scanning several in a row is fine — each code gets
+  its own card.
 - Receive stock, with optional expiry and lot per batch.
+- **Scanning an already-registered item is a scan plus one tap** — its name is
+  already known, so only quantity is left, and that defaults to 1. A code the
+  system has never seen needs a name once; a barcode carries no product name, so
+  that step cannot be skipped. GS1 pharma codes fill in expiry and lot themselves.
 - **Generate a printable barcode label** for items that don't carry one. A
   unique `WARD-XXXXXX` code is minted, rendered as Code128 (or QR, which reads
   better on small or curved items like vials), and downloadable as a PNG to

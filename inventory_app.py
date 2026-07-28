@@ -50,6 +50,130 @@ def _normalize_scan(raw):
     return (info["gtin"] or raw), info["expiry"], info["lot"]
 
 
+def _ingest_codes(queue_key, seen_key, scanned):
+    """Fold newly-seen scanned codes into a session-state queue.
+
+    The scanner reports its whole accumulated list on every rerun, so codes are
+    tracked in `seen` to stop a processed or dismissed entry from reappearing.
+    """
+    queue = st.session_state.setdefault(queue_key, [])
+    seen = st.session_state.setdefault(seen_key, set())
+    added = 0
+    for item in scanned:
+        raw = item["code"]
+        if raw in seen:
+            continue
+        seen.add(raw)
+        code, expiry, lot = _normalize_scan(raw)
+        if any(q["code"] == code for q in queue):
+            continue
+        queue.append(
+            {
+                "code": code, "expiry": expiry, "lot": lot,
+                "raw": raw, "symbology": item.get("format", ""),
+            }
+        )
+        added += 1
+    return added
+
+
+def _add_items_by_scan():
+    """Register / restock items straight from the camera.
+
+    A barcode identifies an item but carries no name, so a code we've never seen
+    needs naming once. After that — and for any already-registered item — a scan
+    plus one tap is the whole interaction. GS1 pharma codes also carry expiry and
+    lot, so those fields fill themselves.
+    """
+    st.caption(
+        "Scan the barcodes on your items. Several in a row is fine — each one "
+        "gets its own card below."
+    )
+
+    scanned = live_scanner(key="scanner_additem")
+    _ingest_codes("add_queue", "add_seen", scanned or [])
+
+    queue = st.session_state.get("add_queue", [])
+    if not queue:
+        st.info("Press **Start scanning** and point the camera at a barcode.")
+        return
+
+    if st.button("Clear scan list", key="clear_add"):
+        st.session_state["add_queue"] = []
+        st.session_state["add_seen"] = set()
+        st.rerun()
+
+    for q in list(queue):
+        code = q["code"]
+        prod = store_db.get_product(code)
+        gs1_expiry, gs1_lot = q.get("expiry"), q.get("lot")
+
+        with st.container(border=True):
+            st.write(f"**Barcode:** `{code}`" + (f"  ·  {q['symbology']}" if q.get("symbology") else ""))
+            if gs1_expiry or gs1_lot:
+                st.success(
+                    "GS1 code — read "
+                    + (f"expiry {gs1_expiry} " if gs1_expiry else "")
+                    + (f"lot {gs1_lot}" if gs1_lot else "")
+                )
+
+            if prod:
+                # Already registered: identity, and often expiry/lot too, are
+                # known — so quantity is the only thing left to state.
+                st.write(f"**{prod['name']}** — already registered, {store_db.on_hand(code)} on hand")
+                with st.form(f"recv_scan_{code}"):
+                    qty = st.number_input("Quantity to add", min_value=1, value=1, step=1)
+                    has_exp = st.checkbox("Has an expiry date", value=gs1_expiry is not None)
+                    exp = st.date_input("Expiry", value=gs1_expiry or date.today(), disabled=not has_exp)
+                    lot = st.text_input("Lot (optional)", value=gs1_lot or "")
+                    if st.form_submit_button(f"➕ Add {prod['name']}", type="primary"):
+                        store_db.add_batch(
+                            code, int(qty),
+                            exp.isoformat() if has_exp else None,
+                            lot.strip() or None,
+                        )
+                        store_db.log_movement_standalone(code, int(qty), "receive", "scanned in")
+                        st.session_state["add_queue"] = [
+                            x for x in st.session_state["add_queue"] if x["code"] != code
+                        ]
+                        st.success(f"Added {qty} × {prod['name']}.")
+                        st.rerun()
+            else:
+                st.info("New barcode — name it once and it's registered for good.")
+                with st.form(f"reg_scan_{code}"):
+                    name = st.text_input("Item name")
+                    min_stock = st.number_input("Minimum stock", min_value=0, value=2, step=1)
+                    qty = st.number_input("Quantity to add now", min_value=0, value=1, step=1)
+                    has_exp = st.checkbox("Has an expiry date", value=gs1_expiry is not None)
+                    exp = st.date_input("Expiry", value=gs1_expiry or date.today(), disabled=not has_exp)
+                    lot = st.text_input("Lot (optional)", value=gs1_lot or "")
+                    if st.form_submit_button("Register & add", type="primary"):
+                        if not name.strip():
+                            st.error("Give the item a name.")
+                        else:
+                            store_db.register_product(code, name.strip(), int(min_stock))
+                            if int(qty) > 0:
+                                store_db.add_batch(
+                                    code, int(qty),
+                                    exp.isoformat() if has_exp else None,
+                                    lot.strip() or None,
+                                )
+                                store_db.log_movement_standalone(
+                                    code, int(qty), "receive", "scanned in"
+                                )
+                            st.session_state["add_queue"] = [
+                                x for x in st.session_state["add_queue"] if x["code"] != code
+                            ]
+                            st.success(f"Registered **{name.strip()}** as `{code}`.")
+                            st.rerun()
+
+            if st.button("Dismiss", key=f"dismiss_{code}"):
+                st.session_state["add_queue"] = [
+                    x for x in st.session_state["add_queue"] if x["code"] != code
+                ]
+                st.rerun()
+
+
 st.title("🏥 Ward Store")
 
 tab_inv, tab_exp, tab_use, tab_back, tab_log = st.tabs(
@@ -96,58 +220,72 @@ with tab_inv:
 
     source = st.radio(
         "Does the item already have a barcode on it?",
-        ["🏷️ No — generate one to print and stick on", "📇 Yes — type or paste it"],
+        [
+            "📷 Yes — scan it with the camera",
+            "📇 Yes — type or paste it",
+            "🏷️ No — generate one to print and stick on",
+        ],
         key="add_source",
     )
+    scan_mode = source.startswith("📷")
     generate = source.startswith("🏷️")
 
-    with st.form("add_item"):
-        name = st.text_input("Item name")
-        min_stock = st.number_input("Minimum stock (warn below this)", min_value=0, value=2, step=1)
-
-        typed_code = ""
-        if not generate:
-            typed_code = st.text_input("Barcode on the item")
-        else:
-            st.caption(
-                f"A unique `{store_db.INTERNAL_PREFIX}-XXXXXX` code is minted on save, "
-                "with a label to print."
+    if scan_mode:
+        # The barcode arrives from the camera rather than from a form field, so
+        # this path renders its own per-code cards.
+        _add_items_by_scan()
+    else:
+        with st.form("add_item"):
+            name = st.text_input("Item name")
+            min_stock = st.number_input(
+                "Minimum stock (warn below this)", min_value=0, value=2, step=1
             )
 
-        st.markdown("**Opening stock** (optional — you can also receive stock later)")
-        open_qty = st.number_input("Quantity", min_value=0, value=0, step=1)
-        has_exp = st.checkbox("Has an expiry date")
-        exp_val = st.date_input("Expiry", value=date.today(), disabled=not has_exp)
-        lot = st.text_input("Lot (optional)")
-
-        submitted = st.form_submit_button("Save item", type="primary")
-
-    if submitted:
-        if not name.strip():
-            st.error("Give the item a name.")
-        elif not generate and not typed_code.strip():
-            st.error("Enter the item's barcode, or switch to generating one.")
-        else:
-            code = store_db.next_internal_barcode() if generate else typed_code.strip()
-            existing = store_db.get_product(code)
-            if existing and not generate:
-                st.error(
-                    f"Barcode `{code}` is already registered to **{existing['name']}**. "
-                    "Edit that item below instead."
+            typed_code = ""
+            if generate:
+                st.caption(
+                    f"A unique `{store_db.INTERNAL_PREFIX}-XXXXXX` code is minted on save, "
+                    "with a label to print."
                 )
             else:
-                store_db.register_product(code, name.strip(), int(min_stock))
-                if open_qty > 0:
-                    store_db.add_batch(
-                        code, int(open_qty),
-                        exp_val.isoformat() if has_exp else None,
-                        lot.strip() or None,
+                typed_code = st.text_input("Barcode on the item")
+
+            st.markdown("**Opening stock** (optional — you can also receive stock later)")
+            open_qty = st.number_input("Quantity", min_value=0, value=0, step=1)
+            has_exp = st.checkbox("Has an expiry date")
+            exp_val = st.date_input("Expiry", value=date.today(), disabled=not has_exp)
+            lot = st.text_input("Lot (optional)")
+
+            submitted = st.form_submit_button("Save item", type="primary")
+
+        if submitted:
+            if not name.strip():
+                st.error("Give the item a name.")
+            elif not generate and not typed_code.strip():
+                st.error("Enter the item's barcode, or switch to generating one.")
+            else:
+                code = store_db.next_internal_barcode() if generate else typed_code.strip()
+                existing = store_db.get_product(code)
+                if existing and not generate:
+                    st.error(
+                        f"Barcode `{code}` is already registered to **{existing['name']}**. "
+                        "Edit that item below instead."
                     )
-                    store_db.log_movement_standalone(code, int(open_qty), "receive", "opening stock")
-                st.success(f"Registered **{name.strip()}** as `{code}`.")
-                if generate:
-                    st.session_state["label_for"] = code
-                st.rerun()
+                else:
+                    store_db.register_product(code, name.strip(), int(min_stock))
+                    if open_qty > 0:
+                        store_db.add_batch(
+                            code, int(open_qty),
+                            exp_val.isoformat() if has_exp else None,
+                            lot.strip() or None,
+                        )
+                        store_db.log_movement_standalone(
+                            code, int(open_qty), "receive", "opening stock"
+                        )
+                    st.success(f"Registered **{name.strip()}** as `{code}`.")
+                    if generate:
+                        st.session_state["label_for"] = code
+                    st.rerun()
 
     # ------------------------------------------------------------------ labels
     just_made = st.session_state.get("label_for")
