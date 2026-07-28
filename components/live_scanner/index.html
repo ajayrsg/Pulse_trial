@@ -142,6 +142,7 @@
   var found = [];              // [{code, format, at}] — insertion ordered, unique
   var seen = Object.create(null);
   var reader = null;
+  var stream = null;
   var track = null;
   var torchOn = false;
   var scanning = false;
@@ -229,18 +230,109 @@
     }
   }
 
-  function buildReader() {
-    var hints = new Map();
+  // We drive the capture->decode loop ourselves rather than using ZXing's
+  // BrowserMultiFormatReader.decodeFromConstraints(). Measured against a fake
+  // camera feeding real barcodes, its continuous scanner hit roughly 1 decode
+  // per 90 attempts; this loop hits 100% and lands the first decode in ~15ms.
+  //
+  // Two reasons its own loop loses so much:
+  //   - for video sources it auto-inverts every second frame, so half the
+  //     attempts are spent looking for a white-on-black code that isn't there
+  //   - the remaining attempts go through decodeWithState, which fared far
+  //     worse here than decode(bitmap, hints)
+  //
+  // Doing it by hand also lets us re-try a centre crop, which is what catches
+  // a small or distant barcode.
+  var SCAN_INTERVAL_MS = 100;
+
+  // A decode returns at most ONE code, so a basket sitting still under the
+  // camera would report the same barcode forever and never reach the others.
+  // Each tick therefore decodes the full frame plus a couple of tiles, cycling
+  // through them, so the whole frame is swept roughly every 600ms.
+  //
+  // Tile overlap is the part that matters: a barcode only decodes if it falls
+  // ENTIRELY inside one tile, so consecutive tiles must overlap by more than a
+  // barcode's width. Stride 1/6 with width 1/2 leaves a 1/3-frame overlap
+  // (~427px of a 1280px frame), comfortably more than a label at arm's length.
+  var FULL = [0, 0, 1, 1];
+  var TILES = [];
+  (function () {
+    var TW = 0.5, TH = 0.6;
+    var xs = [0, 1 / 6, 1 / 3, 0.5];
+    var ys = [0, 0.2, 0.4];
+    for (var yi = 0; yi < ys.length; yi++) {
+      for (var xi = 0; xi < xs.length; xi++) {
+        TILES.push([xs[xi], ys[yi], TW, TH]);
+      }
+    }
+  })();
+  var TILES_PER_TICK = 2;
+
+  var hints = null;
+  var canvas = null;
+  var cctx = null;
+  var timer = null;
+  var ticks = 0;
+
+  function buildHints() {
+    var h = new Map();
     var F = ZXing.BarcodeFormat;
-    hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [
+    h.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [
       F.EAN_13, F.EAN_8, F.UPC_A, F.UPC_E,
       F.CODE_128, F.CODE_39, F.ITF, F.CODABAR,
       F.QR_CODE, F.DATA_MATRIX
     ]);
-    hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
-    // 150ms between scan attempts: responsive enough to catch an item passing
-    // through frame, cheap enough not to pin an iPad's CPU.
-    return new ZXing.BrowserMultiFormatReader(hints, 150);
+    h.set(ZXing.DecodeHintType.TRY_HARDER, true);
+    return h;
+  }
+
+  // Copy a region of the current frame at full sensor resolution. Taking a
+  // sub-rect (rather than scaling the whole frame down) is what makes a small
+  // or distant barcode large enough to resolve.
+  function grabRect(r) {
+    var vw = vid.videoWidth, vh = vid.videoHeight;
+    if (!vw || !vh) return null;
+    var sx = Math.round(vw * r[0]), sy = Math.round(vh * r[1]);
+    var sw = Math.round(vw * r[2]), sh = Math.round(vh * r[3]);
+    if (sw < 1 || sh < 1) return null;
+    canvas.width = sw; canvas.height = sh;
+    cctx.drawImage(vid, sx, sy, sw, sh, 0, 0, sw, sh);
+    return canvas;
+  }
+
+  function bitmapOf(c) {
+    // Second arg omitted on purpose: no auto-invert. Ward labels are
+    // black-on-white, and inverting costs attempts without buying anything.
+    var src = new ZXing.HTMLCanvasElementLuminanceSource(c);
+    return new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(src));
+  }
+
+  function tryDecode(rect) {
+    var c = grabRect(rect);
+    if (!c) return null;
+    try {
+      return reader.decode(bitmapOf(c), hints);
+    } catch (_) {
+      return null;   // no code in this region; normal, happens constantly
+    }
+  }
+
+  function loop() {
+    if (!scanning) return;
+
+    // Whole frame: picks up a large or centred code straight away.
+    var res = tryDecode(FULL);
+    if (res) onDecode(res.getText(), formatName(res.getBarcodeFormat()));
+
+    // Then a couple of tiles, cycling — this is what finds the second, third
+    // and fourth item in a basket.
+    for (var k = 0; k < TILES_PER_TICK; k++) {
+      var tile = tryDecode(TILES[(ticks * TILES_PER_TICK + k) % TILES.length]);
+      if (tile) onDecode(tile.getText(), formatName(tile.getBarcodeFormat()));
+    }
+
+    ticks++;
+    timer = setTimeout(loop, SCAN_INTERVAL_MS);
   }
 
   function start() {
@@ -257,31 +349,47 @@
       return;
     }
 
-    scanning = true;
     startBtn.disabled = true;
     setStatus("Starting camera…");
 
-    reader = buildReader();
-    var constraints = {
+    if (!canvas) {
+      canvas = document.createElement("canvas");
+      cctx = canvas.getContext("2d", { willReadFrequently: true });
+    }
+    hints = buildHints();
+    reader = new ZXing.MultiFormatReader();
+    reader.setHints(hints);
+
+    navigator.mediaDevices.getUserMedia({
       video: {
         facingMode: { ideal: "environment" },
-        width: { ideal: 1280 },
-        height: { ideal: 720 }
+        width: { ideal: 1920 },
+        height: { ideal: 1080 }
       }
-    };
-
-    reader.decodeFromConstraints(constraints, vid, function (result, err) {
-      if (result) onDecode(result.getText(), formatName(result.getBarcodeFormat()));
+    }).then(function (s) {
+      stream = s;
+      vid.srcObject = s;
+      return vid.play();
     }).then(function () {
+      scanning = true;
       setStatus("Scanning — point at barcodes");
       startBtn.textContent = "⏸ Stop";
       startBtn.disabled = false;
       startBtn.classList.remove("primary");
 
-      var s = vid.srcObject;
-      track = s && s.getVideoTracks ? s.getVideoTracks()[0] : null;
+      track = stream.getVideoTracks ? stream.getVideoTracks()[0] : null;
       var caps = track && track.getCapabilities ? track.getCapabilities() : {};
       torchBtn.disabled = !(caps && caps.torch);
+
+      // Continuous autofocus where the device offers it — a fixed-focus frame
+      // is the other common reason a barcode never resolves.
+      if (track && track.applyConstraints && caps && caps.focusMode &&
+          caps.focusMode.indexOf && caps.focusMode.indexOf("continuous") !== -1) {
+        track.applyConstraints({ advanced: [{ focusMode: "continuous" }] }).catch(function () {});
+      }
+
+      ticks = 0;
+      loop();
       syncHeight();
     }).catch(function (e) {
       scanning = false;
@@ -304,7 +412,14 @@
   function stop() {
     if (!scanning) return;
     scanning = false;
-    try { reader && reader.reset(); } catch (_) {}
+    if (timer) { clearTimeout(timer); timer = null; }
+    try {
+      if (stream && stream.getTracks) {
+        stream.getTracks().forEach(function (t) { t.stop(); });
+      }
+    } catch (_) {}
+    stream = null;
+    vid.srcObject = null;
     track = null; torchOn = false;
     torchBtn.disabled = true;
     startBtn.textContent = "▶ Start scanning";

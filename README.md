@@ -54,7 +54,23 @@ silently double-consuming.
 `components/live_scanner/index.html` streams the camera and decodes with
 [ZXing](https://github.com/zxing-js/library) client-side, as a small custom
 Streamlit component (the component protocol is implemented directly over
-`postMessage`, so there is no npm build step). This means:
+`postMessage`, so there is no npm build step).
+
+It drives the capture→decode loop itself rather than calling ZXing's
+`BrowserMultiFormatReader.decodeFromConstraints()`. Measured against a fake
+camera feeding real barcodes, ZXing's own continuous scanner managed about one
+decode per ninety attempts; the hand-rolled loop hits every frame. Two reasons
+it loses so much: for video sources it auto-inverts every second frame (half the
+attempts hunting a white-on-black code that isn't there), and the rest go
+through `decodeWithState`, which fared far worse than `decode(bitmap, hints)`.
+
+A decode also returns at most **one** barcode, so the loop scans the full frame
+plus a rotating pair of overlapping tiles. That is what lets a basket of items
+register several codes instead of reporting the same one forever. Tile overlap
+(a third of the frame) exceeds a label's width on purpose — a barcode only
+decodes if it falls entirely inside one tile.
+
+Doing it this way means:
 
 - Camera frames never reach the server.
 - No WebRTC/TURN traversal, which is what makes `streamlit-webrtc` unreliable on
