@@ -1,0 +1,7 @@
+# Full local development (barcode app + the AI-vision POC + OpenCV camera preview).
+# Streamlit Community Cloud uses requirements.txt (headless, no anthropic) instead.
+streamlit
+pandas
+numpy
+opencv-python
+anthropic

@@ -1,0 +1,9 @@
+{
+  "catalog": [
+    {"name": "coffee mug", "min_stock": 2},
+    {"name": "pen", "min_stock": 3},
+    {"name": "notebook", "min_stock": 1},
+    {"name": "USB cable", "min_stock": 2},
+    {"name": "sticky note pad", "min_stock": 1}
+  ]
+}

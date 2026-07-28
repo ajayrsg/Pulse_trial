@@ -1,0 +1,14 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Local data / artifacts (not source)
+captures/
+audit/
+*.db
+accuracy_report.csv
+ground_truth.json
+
+# Never commit secrets — the API key lives only in the environment, never a file
+.env
