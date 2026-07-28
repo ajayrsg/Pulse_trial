@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<!--
+  Live multi-barcode scanner as a bidirectional Streamlit component.
+
+  Decoding happens HERE, in the browser — camera frames never reach the server.
+  That is faster than round-tripping photos, avoids WebRTC/TURN traversal
+  (which is what makes streamlit-webrtc fragile on Community Cloud), and keeps
+  image data on the device.
+
+  The Streamlit component protocol is implemented directly over postMessage,
+  so this is a single static file with no npm build step.
+
+  Each distinct code is reported ONCE. Re-detections never auto-increment:
+  a camera cannot tell "same item still in frame" from "a second identical
+  item", so quantity is confirmed on the Python side instead of guessed here.
+-->
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    color: #e8e8ea;
+    background: #0f1116;
+  }
+  #wrap { padding: 10px; }
+  #stage {
+    position: relative;
+    width: 100%;
+    background: #000;
+    border-radius: 12px;
+    overflow: hidden;
+    aspect-ratio: 4 / 3;
+  }
+  video { width: 100%; height: 100%; object-fit: cover; display: block; }
+  #reticle {
+    position: absolute; inset: 12% 8%;
+    border: 3px solid rgba(255,255,255,.5);
+    border-radius: 14px;
+    pointer-events: none;
+    transition: border-color .18s, box-shadow .18s;
+  }
+  #reticle.hit {
+    border-color: #21c55d;
+    box-shadow: 0 0 0 4px rgba(33,197,93,.28), inset 0 0 40px rgba(33,197,93,.18);
+  }
+  #status {
+    position: absolute; left: 10px; bottom: 10px;
+    background: rgba(0,0,0,.62); padding: 5px 11px;
+    border-radius: 999px; font-size: 13px;
+  }
+  #controls { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+  button {
+    flex: 1 1 auto; min-width: 96px; min-height: 46px;
+    border: 0; border-radius: 10px;
+    font-size: 15px; font-weight: 600; cursor: pointer;
+    background: #262b36; color: #e8e8ea;
+  }
+  button.primary { background: #2563eb; color: #fff; }
+  button.danger  { background: #3a2226; color: #ffb4b4; }
+  button:disabled { opacity: .45; cursor: default; }
+  #count { margin-top: 12px; font-size: 14px; color: #9aa3b2; }
+  ul { list-style: none; margin: 6px 0 0; padding: 0; max-height: 168px; overflow-y: auto; }
+  li {
+    display: flex; justify-content: space-between; gap: 10px; align-items: center;
+    padding: 8px 10px; margin-bottom: 5px;
+    background: #171b23; border-radius: 8px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px;
+  }
+  li .fmt { color: #7c8798; font-size: 11px; flex-shrink: 0; }
+  li.fresh { animation: pop .5s ease-out; }
+  @keyframes pop {
+    from { background: #14361f; transform: translateY(-3px); }
+    to   { background: #171b23; transform: none; }
+  }
+  #err {
+    display: none; margin-top: 10px; padding: 10px 12px;
+    background: #3a2226; color: #ffb4b4;
+    border-radius: 8px; font-size: 13px; line-height: 1.45;
+  }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="stage">
+    <video id="vid" playsinline muted autoplay></video>
+    <div id="reticle"></div>
+    <div id="status">Idle</div>
+  </div>
+
+  <div id="controls">
+    <button id="start" class="primary">▶ Start scanning</button>
+    <button id="torch" disabled>🔦 Light</button>
+    <button id="clear" class="danger" disabled>Clear</button>
+  </div>
+
+  <div id="count">No codes scanned yet.</div>
+  <ul id="list"></ul>
+  <div id="err"></div>
+</div>
+
+<script src="https://unpkg.com/@zxing/library@0.21.3/umd/index.min.js"></script>
+<script>
+(function () {
+  "use strict";
+
+  // ---------------------------------------------------------------- Streamlit
+  var READY = false;
+
+  function post(msg) {
+    msg.isStreamlitMessage = true;
+    window.parent.postMessage(msg, "*");
+  }
+
+  function ready() {
+    if (READY) return;
+    READY = true;
+    post({ type: "streamlit:componentReady", apiVersion: 1 });
+  }
+
+  function setValue(value) {
+    post({ type: "streamlit:setComponentValue", value: value, dataType: "json" });
+  }
+
+  var lastH = 0;
+  function syncHeight() {
+    var h = document.getElementById("wrap").scrollHeight + 6;
+    if (Math.abs(h - lastH) > 2) {
+      lastH = h;
+      post({ type: "streamlit:setFrameHeight", height: h });
+    }
+  }
+
+  window.addEventListener("message", function (e) {
+    if (e.data && e.data.type === "streamlit:render") syncHeight();
+  });
+
+  // ------------------------------------------------------------------- state
+  var found = [];              // [{code, format, at}] — insertion ordered, unique
+  var seen = Object.create(null);
+  var reader = null;
+  var track = null;
+  var torchOn = false;
+  var scanning = false;
+
+  var vid = document.getElementById("vid");
+  var statusEl = document.getElementById("status");
+  var listEl = document.getElementById("list");
+  var countEl = document.getElementById("count");
+  var reticle = document.getElementById("reticle");
+  var startBtn = document.getElementById("start");
+  var torchBtn = document.getElementById("torch");
+  var clearBtn = document.getElementById("clear");
+  var errEl = document.getElementById("err");
+
+  function showErr(msg) {
+    errEl.textContent = msg;
+    errEl.style.display = "block";
+    syncHeight();
+  }
+
+  function setStatus(s) { statusEl.textContent = s; }
+
+  // Short ascending blip on a new code — a ward user is looking at the basket,
+  // not the screen, so detection needs to be audible.
+  var actx = null;
+  function beep() {
+    try {
+      actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+      var o = actx.createOscillator(), g = actx.createGain();
+      o.connect(g); g.connect(actx.destination);
+      o.type = "sine";
+      o.frequency.setValueAtTime(880, actx.currentTime);
+      o.frequency.linearRampToValueAtTime(1320, actx.currentTime + 0.09);
+      g.gain.setValueAtTime(0.16, actx.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.0001, actx.currentTime + 0.16);
+      o.start(); o.stop(actx.currentTime + 0.17);
+    } catch (_) { /* audio blocked — the visual flash still fires */ }
+  }
+
+  function flash() {
+    reticle.classList.add("hit");
+    setTimeout(function () { reticle.classList.remove("hit"); }, 190);
+  }
+
+  function render() {
+    listEl.innerHTML = "";
+    for (var i = found.length - 1; i >= 0; i--) {
+      var it = found[i];
+      var li = document.createElement("li");
+      if (i === found.length - 1) li.className = "fresh";
+      var a = document.createElement("span");
+      a.textContent = it.code;
+      var b = document.createElement("span");
+      b.className = "fmt";
+      b.textContent = it.format;
+      li.appendChild(a); li.appendChild(b);
+      listEl.appendChild(li);
+    }
+    countEl.textContent = found.length
+      ? found.length + (found.length === 1 ? " code scanned" : " distinct codes scanned")
+      : "No codes scanned yet.";
+    clearBtn.disabled = found.length === 0;
+    syncHeight();
+  }
+
+  function push() {
+    setValue({ codes: found, n: found.length });
+  }
+
+  function onDecode(text, format) {
+    if (!text || seen[text]) return;   // unique-once; quantity confirmed in Python
+    seen[text] = true;
+    found.push({ code: text, format: format || "unknown", at: Date.now() });
+    beep(); flash(); render(); push();
+  }
+
+  // ------------------------------------------------------------------ scanning
+  // getBarcodeFormat() returns a numeric enum; reverse-map it to its name.
+  function formatName(fmt) {
+    try {
+      var name = ZXing.BarcodeFormat[fmt];
+      return typeof name === "string" ? name.replace(/_/g, "-") : String(fmt);
+    } catch (_) {
+      return "unknown";
+    }
+  }
+
+  function buildReader() {
+    var hints = new Map();
+    var F = ZXing.BarcodeFormat;
+    hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [
+      F.EAN_13, F.EAN_8, F.UPC_A, F.UPC_E,
+      F.CODE_128, F.CODE_39, F.ITF, F.CODABAR,
+      F.QR_CODE, F.DATA_MATRIX
+    ]);
+    hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
+    // 150ms between scan attempts: responsive enough to catch an item passing
+    // through frame, cheap enough not to pin an iPad's CPU.
+    return new ZXing.BrowserMultiFormatReader(hints, 150);
+  }
+
+  function start() {
+    if (scanning) return;
+    if (typeof ZXing === "undefined") {
+      showErr(
+        "Barcode library failed to load. This build fetches ZXing from unpkg.com — " +
+        "if this network blocks CDNs, the library needs to be vendored into the repo."
+      );
+      return;
+    }
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      showErr("This browser exposes no camera API.");
+      return;
+    }
+
+    scanning = true;
+    startBtn.disabled = true;
+    setStatus("Starting camera…");
+
+    reader = buildReader();
+    var constraints = {
+      video: {
+        facingMode: { ideal: "environment" },
+        width: { ideal: 1280 },
+        height: { ideal: 720 }
+      }
+    };
+
+    reader.decodeFromConstraints(constraints, vid, function (result, err) {
+      if (result) onDecode(result.getText(), formatName(result.getBarcodeFormat()));
+    }).then(function () {
+      setStatus("Scanning — point at barcodes");
+      startBtn.textContent = "⏸ Stop";
+      startBtn.disabled = false;
+      startBtn.classList.remove("primary");
+
+      var s = vid.srcObject;
+      track = s && s.getVideoTracks ? s.getVideoTracks()[0] : null;
+      var caps = track && track.getCapabilities ? track.getCapabilities() : {};
+      torchBtn.disabled = !(caps && caps.torch);
+      syncHeight();
+    }).catch(function (e) {
+      scanning = false;
+      startBtn.disabled = false;
+      setStatus("Camera unavailable");
+      var name = (e && e.name) || "";
+      if (name === "NotAllowedError") {
+        showErr("Camera permission was denied. Allow camera access for this site, then press Start again.");
+      } else if (name === "NotFoundError" || name === "OverconstrainedError") {
+        showErr("No usable camera found on this device.");
+      } else {
+        showErr(
+          "Could not start the camera: " + (e && e.message ? e.message : e) +
+          " — browsers only allow camera access over HTTPS or on localhost."
+        );
+      }
+    });
+  }
+
+  function stop() {
+    if (!scanning) return;
+    scanning = false;
+    try { reader && reader.reset(); } catch (_) {}
+    track = null; torchOn = false;
+    torchBtn.disabled = true;
+    startBtn.textContent = "▶ Start scanning";
+    startBtn.classList.add("primary");
+    setStatus("Stopped");
+  }
+
+  startBtn.addEventListener("click", function () {
+    if (scanning) stop(); else start();
+  });
+
+  torchBtn.addEventListener("click", function () {
+    if (!track) return;
+    torchOn = !torchOn;
+    track.applyConstraints({ advanced: [{ torch: torchOn }] }).catch(function () {
+      torchBtn.disabled = true;
+    });
+  });
+
+  clearBtn.addEventListener("click", function () {
+    found = [];
+    seen = Object.create(null);
+    render(); push();
+  });
+
+  window.addEventListener("resize", syncHeight);
+
+  render();
+  ready();
+  syncHeight();
+})();
+</script>
+</body>
+</html>

@@ -1,4 +1,12 @@
+# Cloud deploy set for inventory_app.py (Streamlit Community Cloud reads this).
+#
+# No OpenCV: barcode decoding now happens in the browser (see
+# components/live_scanner/index.html), so the server never processes an image.
+# That drops a ~60MB wheel from the deploy. app.py, the local-only vision POC,
+# still needs OpenCV — it lives in requirements-local.txt.
 streamlit
 pandas
 numpy
-opencv-python-headless>=4.8
+python-barcode
+qrcode
+pillow
