@@ -4,82 +4,101 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <!--
-  Live multi-barcode scanner as a bidirectional Streamlit component.
+  Batch barcode scanner as a bidirectional Streamlit component.
 
-  Decoding happens HERE, in the browser — camera frames never reach the server.
-  That is faster than round-tripping photos, avoids WebRTC/TURN traversal
-  (which is what makes streamlit-webrtc fragile on Community Cloud), and keeps
-  image data on the device.
+  Goal: tip a basket under the camera and have everything counted, with no
+  per-item tap and no confirm button.
 
-  The Streamlit component protocol is implemented directly over postMessage,
-  so this is a single static file with no npm build step.
+  Three things make that work:
 
-  Each distinct code is reported ONCE. Re-detections never auto-increment:
-  a camera cannot tell "same item still in frame" from "a second identical
-  item", so quantity is confirmed on the Python side instead of guessed here.
+  1. QUANTITY COMES FROM POSITION, NOT FROM THE CODE.
+     Three identical syringes carry three identical barcodes, so counting
+     unique code strings would read them as one. Instead every decode's
+     location is mapped back into frame coordinates and detections of the same
+     code are clustered by position — three syringes in three places count as
+     three. Overlapping tiles that both see one barcode land on the same
+     coordinate, so they collapse to one item rather than inflating the count.
+
+  2. TILING.
+     A decode returns at most ONE barcode, so a still basket would report the
+     same code forever. Each tick decodes the whole frame plus a rotating pair
+     of overlapping tiles. Overlap must exceed a label's width, because a
+     barcode only decodes if it falls entirely inside one tile.
+
+  3. SETTLE, COMMIT, THEN WAIT FOR A CLEAR FRAME.
+     Counts rise until nothing new has appeared for SETTLE_MS, then the batch
+     commits by itself. After committing, the basket is usually still sitting
+     under the camera, so a new batch cannot start until the frame goes empty.
+     Without that gate the same items would be counted twice.
+
+  Decoding is client-side, so camera frames never reach the server. The
+  Streamlit component protocol is implemented directly over postMessage, so
+  this is one static file with no npm build step.
 -->
 <style>
   * { box-sizing: border-box; }
   body {
     margin: 0;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    color: #e8e8ea;
-    background: #0f1116;
+    color: #e8e8ea; background: #0f1116;
   }
   #wrap { padding: 10px; }
   #stage {
-    position: relative;
-    width: 100%;
-    background: #000;
-    border-radius: 12px;
-    overflow: hidden;
-    aspect-ratio: 4 / 3;
+    position: relative; width: 100%; background: #000;
+    border-radius: 12px; overflow: hidden; aspect-ratio: 4 / 3;
   }
   video { width: 100%; height: 100%; object-fit: cover; display: block; }
   #reticle {
-    position: absolute; inset: 12% 8%;
-    border: 3px solid rgba(255,255,255,.5);
-    border-radius: 14px;
-    pointer-events: none;
-    transition: border-color .18s, box-shadow .18s;
+    position: absolute; inset: 6%;
+    border: 3px solid rgba(255,255,255,.35); border-radius: 14px;
+    pointer-events: none; transition: border-color .15s, box-shadow .15s;
   }
   #reticle.hit {
     border-color: #21c55d;
-    box-shadow: 0 0 0 4px rgba(33,197,93,.28), inset 0 0 40px rgba(33,197,93,.18);
+    box-shadow: 0 0 0 4px rgba(33,197,93,.3), inset 0 0 50px rgba(33,197,93,.2);
   }
-  #status {
+  #reticle.done { border-color: #38bdf8; box-shadow: 0 0 0 4px rgba(56,189,248,.3); }
+  #pill {
     position: absolute; left: 10px; bottom: 10px;
-    background: rgba(0,0,0,.62); padding: 5px 11px;
+    background: rgba(0,0,0,.65); padding: 5px 11px;
     border-radius: 999px; font-size: 13px;
   }
+  #tally {
+    position: absolute; right: 10px; top: 10px;
+    background: rgba(0,0,0,.65); padding: 6px 13px;
+    border-radius: 999px; font-size: 20px; font-weight: 700;
+  }
+  #banner {
+    margin-top: 10px; padding: 14px 16px; border-radius: 12px;
+    font-size: 17px; font-weight: 600; text-align: center; display: none;
+  }
+  #banner.settling { display: block; background: #2a2410; color: #fde68a; }
+  #banner.done { display: block; background: #06281c; color: #6ee7b7; font-size: 20px; }
+  #banner.waiting { display: block; background: #0b2534; color: #7dd3fc; }
   #controls { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
   button {
-    flex: 1 1 auto; min-width: 96px; min-height: 46px;
-    border: 0; border-radius: 10px;
-    font-size: 15px; font-weight: 600; cursor: pointer;
-    background: #262b36; color: #e8e8ea;
+    flex: 1 1 auto; min-width: 92px; min-height: 48px;
+    border: 0; border-radius: 10px; font-size: 15px; font-weight: 600;
+    cursor: pointer; background: #262b36; color: #e8e8ea;
   }
   button.primary { background: #2563eb; color: #fff; }
-  button.danger  { background: #3a2226; color: #ffb4b4; }
   button:disabled { opacity: .45; cursor: default; }
-  #count { margin-top: 12px; font-size: 14px; color: #9aa3b2; }
-  ul { list-style: none; margin: 6px 0 0; padding: 0; max-height: 168px; overflow-y: auto; }
+  ul { list-style: none; margin: 10px 0 0; padding: 0; max-height: 190px; overflow-y: auto; }
   li {
-    display: flex; justify-content: space-between; gap: 10px; align-items: center;
-    padding: 8px 10px; margin-bottom: 5px;
-    background: #171b23; border-radius: 8px;
+    display: flex; justify-content: space-between; align-items: center; gap: 10px;
+    padding: 9px 11px; margin-bottom: 5px; background: #171b23; border-radius: 8px;
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px;
   }
-  li .fmt { color: #7c8798; font-size: 11px; flex-shrink: 0; }
-  li.fresh { animation: pop .5s ease-out; }
-  @keyframes pop {
-    from { background: #14361f; transform: translateY(-3px); }
-    to   { background: #171b23; transform: none; }
+  li .qty {
+    background: #1d4ed8; color: #fff; border-radius: 999px;
+    padding: 2px 10px; font-weight: 700; font-size: 14px; flex-shrink: 0;
   }
+  li.fresh { animation: pop .45s ease-out; }
+  @keyframes pop { from { background: #14361f; } to { background: #171b23; } }
   #err {
     display: none; margin-top: 10px; padding: 10px 12px;
-    background: #3a2226; color: #ffb4b4;
-    border-radius: 8px; font-size: 13px; line-height: 1.45;
+    background: #3a2226; color: #ffb4b4; border-radius: 8px;
+    font-size: 13px; line-height: 1.45;
   }
 </style>
 </head>
@@ -88,16 +107,18 @@
   <div id="stage">
     <video id="vid" playsinline muted autoplay></video>
     <div id="reticle"></div>
-    <div id="status">Idle</div>
+    <div id="tally">0</div>
+    <div id="pill">Idle</div>
   </div>
+
+  <div id="banner"></div>
 
   <div id="controls">
     <button id="start" class="primary">▶ Start scanning</button>
     <button id="torch" disabled>🔦 Light</button>
-    <button id="clear" class="danger" disabled>Clear</button>
+    <button id="next" disabled>Next batch</button>
   </div>
 
-  <div id="count">No codes scanned yet.</div>
   <ul id="list"></ul>
   <div id="err"></div>
 </div>
@@ -109,174 +130,165 @@
 
   // ---------------------------------------------------------------- Streamlit
   var READY = false;
-
-  function post(msg) {
-    msg.isStreamlitMessage = true;
-    window.parent.postMessage(msg, "*");
-  }
-
+  function post(msg) { msg.isStreamlitMessage = true; window.parent.postMessage(msg, "*"); }
   function ready() {
     if (READY) return;
     READY = true;
     post({ type: "streamlit:componentReady", apiVersion: 1 });
   }
-
   function setValue(value) {
     post({ type: "streamlit:setComponentValue", value: value, dataType: "json" });
   }
-
   var lastH = 0;
   function syncHeight() {
     var h = document.getElementById("wrap").scrollHeight + 6;
-    if (Math.abs(h - lastH) > 2) {
-      lastH = h;
-      post({ type: "streamlit:setFrameHeight", height: h });
-    }
+    if (Math.abs(h - lastH) > 2) { lastH = h; post({ type: "streamlit:setFrameHeight", height: h }); }
   }
 
+  var MODE = "scan";
+  var SETTLE_MS = 2500;
   window.addEventListener("message", function (e) {
-    if (e.data && e.data.type === "streamlit:render") syncHeight();
+    if (!e.data || e.data.type !== "streamlit:render") return;
+    var args = e.data.args || {};
+    if (args.mode) MODE = args.mode;
+    if (args.settle_ms) SETTLE_MS = args.settle_ms;
+    syncHeight();
   });
 
-  // ------------------------------------------------------------------- state
-  var found = [];              // [{code, format, at}] — insertion ordered, unique
-  var seen = Object.create(null);
-  var reader = null;
-  var stream = null;
-  var track = null;
-  var torchOn = false;
-  var scanning = false;
+  // -------------------------------------------------------------------- tuning
+  var SCAN_INTERVAL_MS = 90;
+  var TILES_PER_TICK = 1;
+  // Most barcodes we will pull out of one region before giving up. Each extra
+  // one costs another decode pass, so this bounds the worst-case tick; anything
+  // beyond it is picked up by the tiles on later ticks.
+  var MAX_PER_REGION = 25;
+  // Deduplicating detections of the SAME code needs care in both directions:
+  // count one symbol twice and stock goes short, merge two real items and it
+  // goes long. A 1D symbol's x-extent comes straight from its result points and
+  // is precise, whereas the reported y is just whichever scan line matched. So
+  // two hits are the same physical item when their x-intervals substantially
+  // overlap AND they are vertically close relative to the symbol's own size.
+  var SAME_X_OVERLAP = 0.5;
+  // The matched scan line can sit anywhere inside a symbol, so two reads of ONE
+  // barcode differ in y by up to its full height — the reach must therefore
+  // exceed 1.0, not sit under it. Two stacked items are still separated by a
+  // height plus a gap, and an x-overlap is required first, so this stays safe.
+  var SAME_Y_OF_HEIGHT = 1.1;
+  // Masking has to be exact. Too little and the unmasked remainder of a tall
+  // symbol is re-found as a second item; too much and it clips the neighbouring
+  // items in a packed basket so they never decode. So rather than guessing a
+  // height from the width, the symbol's real vertical extent is measured: rows
+  // belonging to a barcode contain many dark/light transitions, blank rows have
+  // almost none.
+  var BAR_ROW_MIN_TRANSITIONS = 8;
+  var MAX_EXTENT_PROBE = 400;   // rows to walk from the matched scan line
+  // Consecutive empty sweeps needed before a fresh batch may start.
+  var CLEAR_SWEEPS = 2;
 
-  var vid = document.getElementById("vid");
-  var statusEl = document.getElementById("status");
-  var listEl = document.getElementById("list");
-  var countEl = document.getElementById("count");
-  var reticle = document.getElementById("reticle");
-  var startBtn = document.getElementById("start");
-  var torchBtn = document.getElementById("torch");
-  var clearBtn = document.getElementById("clear");
-  var errEl = document.getElementById("err");
-
-  function showErr(msg) {
-    errEl.textContent = msg;
-    errEl.style.display = "block";
-    syncHeight();
-  }
-
-  function setStatus(s) { statusEl.textContent = s; }
-
-  // Short ascending blip on a new code — a ward user is looking at the basket,
-  // not the screen, so detection needs to be audible.
-  var actx = null;
-  function beep() {
-    try {
-      actx = actx || new (window.AudioContext || window.webkitAudioContext)();
-      var o = actx.createOscillator(), g = actx.createGain();
-      o.connect(g); g.connect(actx.destination);
-      o.type = "sine";
-      o.frequency.setValueAtTime(880, actx.currentTime);
-      o.frequency.linearRampToValueAtTime(1320, actx.currentTime + 0.09);
-      g.gain.setValueAtTime(0.16, actx.currentTime);
-      g.gain.exponentialRampToValueAtTime(0.0001, actx.currentTime + 0.16);
-      o.start(); o.stop(actx.currentTime + 0.17);
-    } catch (_) { /* audio blocked — the visual flash still fires */ }
-  }
-
-  function flash() {
-    reticle.classList.add("hit");
-    setTimeout(function () { reticle.classList.remove("hit"); }, 190);
-  }
-
-  function render() {
-    listEl.innerHTML = "";
-    for (var i = found.length - 1; i >= 0; i--) {
-      var it = found[i];
-      var li = document.createElement("li");
-      if (i === found.length - 1) li.className = "fresh";
-      var a = document.createElement("span");
-      a.textContent = it.code;
-      var b = document.createElement("span");
-      b.className = "fmt";
-      b.textContent = it.format;
-      li.appendChild(a); li.appendChild(b);
-      listEl.appendChild(li);
-    }
-    countEl.textContent = found.length
-      ? found.length + (found.length === 1 ? " code scanned" : " distinct codes scanned")
-      : "No codes scanned yet.";
-    clearBtn.disabled = found.length === 0;
-    syncHeight();
-  }
-
-  function push() {
-    setValue({ codes: found, n: found.length });
-  }
-
-  function onDecode(text, format) {
-    if (!text || seen[text]) return;   // unique-once; quantity confirmed in Python
-    seen[text] = true;
-    found.push({ code: text, format: format || "unknown", at: Date.now() });
-    beep(); flash(); render(); push();
-  }
-
-  // ------------------------------------------------------------------ scanning
-  // getBarcodeFormat() returns a numeric enum; reverse-map it to its name.
-  function formatName(fmt) {
-    try {
-      var name = ZXing.BarcodeFormat[fmt];
-      return typeof name === "string" ? name.replace(/_/g, "-") : String(fmt);
-    } catch (_) {
-      return "unknown";
-    }
-  }
-
-  // We drive the capture->decode loop ourselves rather than using ZXing's
-  // BrowserMultiFormatReader.decodeFromConstraints(). Measured against a fake
-  // camera feeding real barcodes, its continuous scanner hit roughly 1 decode
-  // per 90 attempts; this loop hits 100% and lands the first decode in ~15ms.
-  //
-  // Two reasons its own loop loses so much:
-  //   - for video sources it auto-inverts every second frame, so half the
-  //     attempts are spent looking for a white-on-black code that isn't there
-  //   - the remaining attempts go through decodeWithState, which fared far
-  //     worse here than decode(bitmap, hints)
-  //
-  // Doing it by hand also lets us re-try a centre crop, which is what catches
-  // a small or distant barcode.
-  var SCAN_INTERVAL_MS = 100;
-
-  // A decode returns at most ONE code, so a basket sitting still under the
-  // camera would report the same barcode forever and never reach the others.
-  // Each tick therefore decodes the full frame plus a couple of tiles, cycling
-  // through them, so the whole frame is swept roughly every 600ms.
-  //
-  // Tile overlap is the part that matters: a barcode only decodes if it falls
-  // ENTIRELY inside one tile, so consecutive tiles must overlap by more than a
-  // barcode's width. Stride 1/6 with width 1/2 leaves a 1/3-frame overlap
-  // (~427px of a 1280px frame), comfortably more than a label at arm's length.
   var FULL = [0, 0, 1, 1];
   var TILES = [];
   (function () {
     var TW = 0.5, TH = 0.6;
     var xs = [0, 1 / 6, 1 / 3, 0.5];
     var ys = [0, 0.2, 0.4];
-    for (var yi = 0; yi < ys.length; yi++) {
-      for (var xi = 0; xi < xs.length; xi++) {
+    for (var yi = 0; yi < ys.length; yi++)
+      for (var xi = 0; xi < xs.length; xi++)
         TILES.push([xs[xi], ys[yi], TW, TH]);
-      }
-    }
   })();
-  var TILES_PER_TICK = 2;
 
-  var hints = null;
-  var canvas = null;
-  var cctx = null;
-  var timer = null;
-  var ticks = 0;
+  // --------------------------------------------------------------------- state
+  var STATE = "idle";          // idle | scanning | waiting_clear
+  var session = {};            // code -> {qty, format}
+  var sweepHits = [];          // detections in the sweep under way
+  var tileCursor = 0;
+  var emptySweeps = 0;
+  var lastChangeAt = 0;
+  var batchId = 0;
+  var nonce = 0;
+
+  var reader = null, hints = null, stream = null, track = null;
+  var canvas = null, cctx = null, timer = null, torchOn = false;
+
+  var vid = document.getElementById("vid");
+  var pill = document.getElementById("pill");
+  var tally = document.getElementById("tally");
+  var banner = document.getElementById("banner");
+  var listEl = document.getElementById("list");
+  var reticle = document.getElementById("reticle");
+  var startBtn = document.getElementById("start");
+  var torchBtn = document.getElementById("torch");
+  var nextBtn = document.getElementById("next");
+  var errEl = document.getElementById("err");
+
+  function showErr(m) { errEl.textContent = m; errEl.style.display = "block"; syncHeight(); }
+  function now() { return (window.performance && performance.now) ? performance.now() : 0; }
+  function push(arr, items) { for (var i = 0; i < items.length; i++) arr.push(items[i]); }
+
+  var actx = null;
+  function beep(high) {
+    try {
+      actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+      var o = actx.createOscillator(), g = actx.createGain();
+      o.connect(g); g.connect(actx.destination);
+      o.type = "sine";
+      o.frequency.setValueAtTime(high ? 1180 : 820, actx.currentTime);
+      o.frequency.linearRampToValueAtTime(high ? 1560 : 1180, actx.currentTime + .08);
+      g.gain.setValueAtTime(.16, actx.currentTime);
+      g.gain.exponentialRampToValueAtTime(.0001, actx.currentTime + .15);
+      o.start(); o.stop(actx.currentTime + .16);
+    } catch (_) {}
+  }
+  function flash(cls) {
+    reticle.classList.add(cls);
+    setTimeout(function () { reticle.classList.remove(cls); }, 220);
+  }
+
+  function totalUnits() {
+    var n = 0;
+    for (var k in session) n += session[k].pts.length;
+    return n;
+  }
+
+  function render(freshCode) {
+    listEl.innerHTML = "";
+    var codes = Object.keys(session);
+    for (var i = 0; i < codes.length; i++) {
+      var c = codes[i];
+      var li = document.createElement("li");
+      if (c === freshCode) li.className = "fresh";
+      var a = document.createElement("span"); a.textContent = c;
+      var b = document.createElement("span"); b.className = "qty";
+      b.textContent = "×" + session[c].pts.length;
+      li.appendChild(a); li.appendChild(b);
+      listEl.appendChild(li);
+    }
+    tally.textContent = String(totalUnits());
+    syncHeight();
+  }
+
+  function publish(batch) {
+    nonce++;
+    var items = [];
+    for (var k in session) items.push({ code: k, qty: session[k].pts.length, format: session[k].format });
+    setValue({
+      state: STATE,
+      mode: MODE,
+      live: items,
+      batch: batch || null,
+      nonce: nonce
+    });
+  }
+
+  // ------------------------------------------------------------------ decoding
+  function formatName(fmt) {
+    try {
+      var n = ZXing.BarcodeFormat[fmt];
+      return typeof n === "string" ? n.replace(/_/g, "-") : String(fmt);
+    } catch (_) { return "unknown"; }
+  }
 
   function buildHints() {
-    var h = new Map();
-    var F = ZXing.BarcodeFormat;
+    var h = new Map(), F = ZXing.BarcodeFormat;
     h.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [
       F.EAN_13, F.EAN_8, F.UPC_A, F.UPC_E,
       F.CODE_128, F.CODE_39, F.ITF, F.CODABAR,
@@ -286,71 +298,266 @@
     return h;
   }
 
-  // Copy a region of the current frame at full sensor resolution. Taking a
-  // sub-rect (rather than scaling the whole frame down) is what makes a small
-  // or distant barcode large enough to resolve.
   function grabRect(r) {
     var vw = vid.videoWidth, vh = vid.videoHeight;
     if (!vw || !vh) return null;
-    var sx = Math.round(vw * r[0]), sy = Math.round(vh * r[1]);
     var sw = Math.round(vw * r[2]), sh = Math.round(vh * r[3]);
     if (sw < 1 || sh < 1) return null;
     canvas.width = sw; canvas.height = sh;
-    cctx.drawImage(vid, sx, sy, sw, sh, 0, 0, sw, sh);
+    cctx.drawImage(vid, Math.round(vw * r[0]), Math.round(vh * r[1]), sw, sh, 0, 0, sw, sh);
     return canvas;
   }
 
-  function bitmapOf(c) {
-    // Second arg omitted on purpose: no auto-invert. Ward labels are
-    // black-on-white, and inverting costs attempts without buying anything.
-    var src = new ZXing.HTMLCanvasElementLuminanceSource(c);
-    return new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(src));
+  // Walk up and down from the matched scan line to find where the bar pattern
+  // stops, so the mask covers this symbol and nothing else.
+  function verticalExtent(x0, x1, y) {
+    var W = canvas.width, H = canvas.height;
+    var sx = Math.max(0, Math.floor(x0));
+    var ex = Math.min(W, Math.ceil(x1));
+    var w = ex - sx;
+    if (w < 8) return null;
+
+    var top = Math.max(0, Math.floor(y) - MAX_EXTENT_PROBE);
+    var bot = Math.min(H, Math.floor(y) + MAX_EXTENT_PROBE);
+    var strip;
+    try {
+      strip = cctx.getImageData(sx, top, w, bot - top).data;
+    } catch (_) {
+      return null;
+    }
+
+    function transitions(row) {
+      var base = row * w * 4, dark = strip[base] < 128, count = 0;
+      for (var i = 1; i < w; i++) {
+        var d = strip[base + i * 4] < 128;
+        if (d !== dark) { count++; dark = d; }
+      }
+      return count;
+    }
+
+    var yr = Math.floor(y) - top;
+    if (yr < 0 || yr >= (bot - top)) return null;
+
+    var up = yr;
+    while (up > 0 && transitions(up - 1) >= BAR_ROW_MIN_TRANSITIONS) up--;
+    var down = yr;
+    while (down < (bot - top) - 1 && transitions(down + 1) >= BAR_ROW_MIN_TRANSITIONS) down++;
+
+    return { top: top + up, bottom: top + down };
   }
 
-  function tryDecode(rect) {
-    var c = grabRect(rect);
-    if (!c) return null;
+  function decodeCanvas() {
     try {
-      return reader.decode(bitmapOf(c), hints);
+      // No auto-invert: labels are black-on-white, and ZXing's own loop wastes
+      // half its attempts inverting frames.
+      var src = new ZXing.HTMLCanvasElementLuminanceSource(canvas);
+      return reader.decode(new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(src)), hints);
     } catch (_) {
-      return null;   // no code in this region; normal, happens constantly
+      return null;          // nothing left in this region; happens constantly
     }
+  }
+
+  // Decode a region repeatedly, whiting out each barcode as it is found so the
+  // next pass reaches the next one. Without this a region holding several codes
+  // reports only whichever one ZXing happens to hit first, and identical items
+  // sitting side by side can never be counted.
+  function decodeAll(rect) {
+    var c = grabRect(rect);
+    if (!c) return [];
+    var vw = vid.videoWidth, vh = vid.videoHeight;
+    var ox = vw * rect[0], oy = vh * rect[1];
+    var hits = [];
+
+    for (var k = 0; k < MAX_PER_REGION; k++) {
+      var res = decodeCanvas();
+      if (!res) break;
+
+      var pts = [];
+      try { pts = res.getResultPoints() || []; } catch (_) {}
+      var minX = 1e9, maxX = -1e9, minY = 1e9, maxY = -1e9, n = 0;
+      for (var i = 0; i < pts.length; i++) {
+        if (!pts[i]) continue;
+        var px = pts[i].getX(), py = pts[i].getY();
+        if (px < minX) minX = px;
+        if (px > maxX) maxX = px;
+        if (py < minY) minY = py;
+        if (py > maxY) maxY = py;
+        n++;
+      }
+      if (n === 0) { minX = 0; maxX = canvas.width; minY = 0; maxY = canvas.height; }
+
+      var w = Math.max(1, maxX - minX);
+      var midY = (minY + maxY) / 2;
+
+      // 2D symbols (QR, DataMatrix) return real corners, so their extent is
+      // already known. A 1D symbol's points share one scan line, so measure it.
+      var top = minY, bottom = maxY;
+      if ((maxY - minY) < w * 0.15) {
+        var ext = verticalExtent(minX, maxX, midY);
+        if (ext) { top = ext.top; bottom = ext.bottom; }
+        else { top = midY - 10; bottom = midY + 10; }
+      }
+
+      hits.push({
+        code: res.getText(),
+        format: formatName(res.getBarcodeFormat()),
+        // Frame coordinates, so the same label seen via the full frame and via
+        // a tile lands on the same place instead of counting twice.
+        x0: ox + minX,
+        x1: ox + maxX,
+        y: oy + midY,
+        w: w,
+        h: Math.max(1, bottom - top)
+      });
+
+      var padX = Math.max(4, w * 0.02);
+      var padY = 3;
+      cctx.fillStyle = "#fff";
+      cctx.fillRect(minX - padX, top - padY,
+                    w + 2 * padX, (bottom - top) + 2 * padY);
+    }
+    return hits;
+  }
+
+  // Are these two detections of one code the same physical item?
+  function samePlace(a, b) {
+    var overlap = Math.min(a.x1, b.x1) - Math.max(a.x0, b.x0);
+    if (overlap <= 0) return false;                      // side by side: two items
+    if (overlap / Math.min(a.w, b.w) < SAME_X_OVERLAP) return false;
+    var reach = SAME_Y_OF_HEIGHT * Math.max(a.h || 1, b.h || 1);
+    return Math.abs(a.y - b.y) < Math.max(6, reach);
+  }
+
+  // Fold a sweep's detections into the batch.
+  //
+  // Each sweep is clustered on its own and the HIGHEST reading per code wins.
+  // Accumulating a union of positions across sweeps was tried and rejected: it
+  // raised counts in dense baskets but also let position jitter between sweeps
+  // add phantom items, turning one barcode into two. Counting a sweep at a time
+  // cannot overcount, which is the error that matters most — a silent overcount
+  // on withdrawal takes stock off the record that is still on the shelf.
+  function foldSweep() {
+    var byCode = {};
+    for (var i = 0; i < sweepHits.length; i++) {
+      var h = sweepHits[i];
+      var group = byCode[h.code] || (byCode[h.code] = { pts: [], format: h.format });
+      var merged = false;
+      for (var j = 0; j < group.pts.length; j++) {
+        if (samePlace(group.pts[j], h)) { merged = true; break; }
+      }
+      if (!merged) group.pts.push(h);
+    }
+
+    var changed = false, freshCode = null;
+    for (var code in byCode) {
+      var pts = byCode[code].pts;
+      var cur = session[code];
+      if (!cur) {
+        session[code] = { pts: pts, format: byCode[code].format };
+        changed = true; freshCode = code;
+      } else if (pts.length > cur.pts.length) {
+        // A partially occluded sweep must not lower a count already seen whole.
+        cur.pts = pts;
+        changed = true; freshCode = code;
+      }
+    }
+
+    var sawAnything = sweepHits.length > 0;
+    sweepHits = [];
+
+    if (STATE === "waiting_clear") {
+      emptySweeps = sawAnything ? 0 : emptySweeps + 1;
+      if (emptySweeps >= CLEAR_SWEEPS) beginBatch();
+      return;
+    }
+
+    if (changed) {
+      lastChangeAt = now();
+      beep(false); flash("hit");
+      render(freshCode);
+      publish(null);
+      setBanner("settling");
+    }
+    if (!sawAnything) emptySweeps++;
+  }
+
+  function setBanner(kind, text) {
+    banner.className = kind || "";
+    if (kind === "settling") {
+      banner.textContent = "Counting… hold still";
+    } else if (kind === "done") {
+      banner.textContent = text || "✓ Captured";
+    } else if (kind === "waiting") {
+      banner.textContent = text || "Remove the items to scan the next batch";
+    } else {
+      banner.textContent = "";
+    }
+    syncHeight();
+  }
+
+  function commit() {
+    var items = [];
+    for (var k in session) items.push({ code: k, qty: session[k].pts.length, format: session[k].format });
+    if (!items.length) return;
+    batchId++;
+    var units = totalUnits();
+    STATE = "waiting_clear";
+    emptySweeps = 0;
+    nextBtn.disabled = false;
+    beep(true); flash("done");
+    setBanner("done", "✓ Captured " + units + (units === 1 ? " item" : " items"));
+    pill.textContent = "Captured — remove items";
+    publish({ id: batchId, items: items, units: units });
+    // Leave the list on screen: it IS the confirmation of what was taken.
+  }
+
+  function beginBatch() {
+    session = {};
+    sweepHits = [];
+    emptySweeps = 0;
+    lastChangeAt = 0;
+    STATE = "scanning";
+    nextBtn.disabled = true;
+    setBanner("");
+    pill.textContent = "Scanning — point at items";
+    render(null);
+    publish(null);
   }
 
   function loop() {
-    if (!scanning) return;
+    if (STATE === "idle") return;
 
-    // Whole frame: picks up a large or centred code straight away.
-    var res = tryDecode(FULL);
-    if (res) onDecode(res.getText(), formatName(res.getBarcodeFormat()));
-
-    // Then a couple of tiles, cycling — this is what finds the second, third
-    // and fourth item in a basket.
+    // The full frame with masking does most of the work: it yields every code
+    // it can see, including repeats of the same one. Tiles then re-check
+    // magnified regions for anything too small to resolve full-frame.
+    push(sweepHits, decodeAll(FULL));
     for (var k = 0; k < TILES_PER_TICK; k++) {
-      var tile = tryDecode(TILES[(ticks * TILES_PER_TICK + k) % TILES.length]);
-      if (tile) onDecode(tile.getText(), formatName(tile.getBarcodeFormat()));
+      push(sweepHits, decodeAll(TILES[tileCursor % TILES.length]));
+      tileCursor++;
+      if (tileCursor % TILES.length === 0) foldSweep();   // sweep complete
     }
 
-    ticks++;
+    if (STATE === "scanning" && lastChangeAt && (now() - lastChangeAt) > SETTLE_MS) {
+      commit();
+    }
+
     timer = setTimeout(loop, SCAN_INTERVAL_MS);
   }
 
+  // ------------------------------------------------------------------- camera
   function start() {
-    if (scanning) return;
+    if (STATE !== "idle") return;
     if (typeof ZXing === "undefined") {
-      showErr(
-        "Barcode library failed to load. This build fetches ZXing from unpkg.com — " +
-        "if this network blocks CDNs, the library needs to be vendored into the repo."
-      );
+      showErr("Barcode library failed to load. This build fetches ZXing from unpkg.com — " +
+              "if this network blocks CDNs, the library needs to be vendored into the repo.");
       return;
     }
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       showErr("This browser exposes no camera API.");
       return;
     }
-
     startBtn.disabled = true;
-    setStatus("Starting camera…");
+    pill.textContent = "Starting camera…";
 
     if (!canvas) {
       canvas = document.createElement("canvas");
@@ -363,91 +570,74 @@
     navigator.mediaDevices.getUserMedia({
       video: {
         facingMode: { ideal: "environment" },
-        width: { ideal: 1920 },
-        height: { ideal: 1080 }
+        width: { ideal: 1920 }, height: { ideal: 1080 }
       }
     }).then(function (s) {
-      stream = s;
-      vid.srcObject = s;
-      return vid.play();
+      stream = s; vid.srcObject = s; return vid.play();
     }).then(function () {
-      scanning = true;
-      setStatus("Scanning — point at barcodes");
-      startBtn.textContent = "⏸ Stop";
-      startBtn.disabled = false;
+      startBtn.textContent = "⏹ Stop";
       startBtn.classList.remove("primary");
+      startBtn.disabled = false;
 
       track = stream.getVideoTracks ? stream.getVideoTracks()[0] : null;
       var caps = track && track.getCapabilities ? track.getCapabilities() : {};
       torchBtn.disabled = !(caps && caps.torch);
-
-      // Continuous autofocus where the device offers it — a fixed-focus frame
-      // is the other common reason a barcode never resolves.
+      // Fixed focus is the other common reason a barcode never resolves.
       if (track && track.applyConstraints && caps && caps.focusMode &&
           caps.focusMode.indexOf && caps.focusMode.indexOf("continuous") !== -1) {
         track.applyConstraints({ advanced: [{ focusMode: "continuous" }] }).catch(function () {});
       }
-
-      ticks = 0;
+      tileCursor = 0;
+      beginBatch();
       loop();
       syncHeight();
     }).catch(function (e) {
-      scanning = false;
+      STATE = "idle";
       startBtn.disabled = false;
-      setStatus("Camera unavailable");
-      var name = (e && e.name) || "";
-      if (name === "NotAllowedError") {
+      pill.textContent = "Camera unavailable";
+      var n = (e && e.name) || "";
+      if (n === "NotAllowedError") {
         showErr("Camera permission was denied. Allow camera access for this site, then press Start again.");
-      } else if (name === "NotFoundError" || name === "OverconstrainedError") {
+      } else if (n === "NotFoundError" || n === "OverconstrainedError") {
         showErr("No usable camera found on this device.");
       } else {
-        showErr(
-          "Could not start the camera: " + (e && e.message ? e.message : e) +
-          " — browsers only allow camera access over HTTPS or on localhost."
-        );
+        showErr("Could not start the camera: " + (e && e.message ? e.message : e) +
+                " — browsers only allow camera access over HTTPS or on localhost.");
       }
     });
   }
 
   function stop() {
-    if (!scanning) return;
-    scanning = false;
+    if (STATE === "idle") return;
+    STATE = "idle";
     if (timer) { clearTimeout(timer); timer = null; }
     try {
-      if (stream && stream.getTracks) {
-        stream.getTracks().forEach(function (t) { t.stop(); });
-      }
+      if (stream && stream.getTracks) stream.getTracks().forEach(function (t) { t.stop(); });
     } catch (_) {}
-    stream = null;
-    vid.srcObject = null;
-    track = null; torchOn = false;
-    torchBtn.disabled = true;
+    stream = null; vid.srcObject = null; track = null; torchOn = false;
+    torchBtn.disabled = true; nextBtn.disabled = true;
     startBtn.textContent = "▶ Start scanning";
     startBtn.classList.add("primary");
-    setStatus("Stopped");
+    pill.textContent = "Stopped";
+    setBanner("");
   }
 
   startBtn.addEventListener("click", function () {
-    if (scanning) stop(); else start();
+    if (STATE === "idle") start(); else stop();
   });
-
   torchBtn.addEventListener("click", function () {
     if (!track) return;
     torchOn = !torchOn;
-    track.applyConstraints({ advanced: [{ torch: torchOn }] }).catch(function () {
-      torchBtn.disabled = true;
-    });
+    track.applyConstraints({ advanced: [{ torch: torchOn }] })
+      .catch(function () { torchBtn.disabled = true; });
   });
-
-  clearBtn.addEventListener("click", function () {
-    found = [];
-    seen = Object.create(null);
-    render(); push();
+  // Escape hatch: if the items cannot be cleared from view, move on manually.
+  nextBtn.addEventListener("click", function () {
+    if (STATE === "waiting_clear") beginBatch();
   });
 
   window.addEventListener("resize", syncHeight);
-
-  render();
+  render(null);
   ready();
   syncHeight();
 })();

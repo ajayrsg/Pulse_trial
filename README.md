@@ -1,128 +1,152 @@
-# Ward Storeroom Inventory — Camera POC
+# Ward Storeroom Inventory — batch-scanning stock control
 
-Internal proof-of-concept testing whether a camera can help track decentralized
-ward storeroom stock. Two apps live here:
+Internal proof-of-concept. A camera counts a whole basket of items at once so
+stocking up and withdrawing take seconds instead of a scan-per-item.
 
-- **`inventory_app.py`** — the barcode inventory web-app (phone/tablet friendly,
-  no login). **This is the app deployed to the cloud.**
-- **`app.py`** — the earlier AI-vision POC (counting items from a photo, with an
-  audit trail). Local only; needs an Anthropic API credential.
+- **`inventory_app.py`** — the app. **This is what gets deployed.**
+- **`app.py`** — an earlier AI-vision experiment (counting items from a photo).
+  Local only, needs an Anthropic API credential, not part of the flow above.
 
-## The inventory app
+## The idea that makes it work
 
-Two audiences, deliberately separated into different tabs.
+Three identical syringes carry three **identical** barcodes, so counting unique
+codes would read them as one. Quantity therefore comes from **position**: every
+decode's location is mapped into frame coordinates, and detections of the same
+code at different places are different items.
 
-**Admin — `📦 Inventory` and `⏰ Expiry`**
+Two problems had to be solved for that to hold:
 
-- Register items and set a minimum stock level (the app flags anything below it).
-  Three ways to supply the barcode: **scan it with the camera** (the default),
-  type it, or generate one. Scanning several in a row is fine — each code gets
-  its own card.
-- Receive stock, with optional expiry and lot per batch.
-- **Scanning an already-registered item is a scan plus one tap** — its name is
-  already known, so only quantity is left, and that defaults to 1. A code the
-  system has never seen needs a name once; a barcode carries no product name, so
-  that step cannot be skipped. GS1 pharma codes fill in expiry and lot themselves.
-- **Generate a printable barcode label** for items that don't carry one. A
-  unique `WARD-XXXXXX` code is minted, rendered as Code128 (or QR, which reads
-  better on small or curved items like vials), and downloadable as a PNG to
-  print and stick on the item or its shelf bin.
-- Correct mistakes: edit names and minimums, adjust or delete batches, delete items.
+- A decode returns at most one barcode. So each region is decoded repeatedly,
+  whiting out each symbol as it is found, until nothing is left — that is what
+  lets several items (identical or not) come out of one frame.
+- Masking has to be exact. Too little and the unmasked remainder of a tall
+  symbol is re-found as a second item; too much and it clips the neighbours in a
+  packed basket. So a symbol's real vertical extent is measured rather than
+  guessed: rows of bars contain many dark/light transitions, blank rows do not.
 
-**User — `➖ Consume` and `➕ Add Back`**
+Counting is done per sweep, taking the highest reading per code. Accumulating a
+union of positions across sweeps was tried and rejected — it raised counts in
+dense baskets but let jitter turn one barcode into two, and a silent overcount on
+withdrawal takes stock off the record that is still on the shelf.
 
-- Press **Start scanning** and point the camera at a basket. Codes accumulate
-  live, with a beep and a green flash per new code — no button press per item,
-  so you can prop a tablet over the basket and pass items through frame.
-- **Nothing is committed until you confirm.** Each distinct barcode is listed
-  once with an editable quantity.
-- `Consume` depletes stock **first-expiry-first-out**. `Add Back` returns items
-  to the soonest-expiring batch so they keep their original expiry.
+### No confirm step
 
-**`🧾 Activity`** shows the movement log — every consume, add-back and receipt.
+Counts rise until nothing new has appeared for ~2.5s, then the batch **commits by
+itself**. After committing, the basket is usually still under the camera, so a
+new batch cannot start until the frame goes empty. Without that gate the same
+items would post twice. A **Next batch** button is there for when the items
+cannot be cleared from view.
 
-### Why each barcode is only counted once
+Because nothing is confirmed by a person, a wrong count needs somewhere to be
+fixed: **Admin → Storerooms → Inventory Assigned → Correct a count**, which logs
+an adjustment against the batch.
 
-Three identical syringes carry three *identical* barcodes. A camera cannot tell
-"the same item still in frame" from "a second identical item", so the scanner
-never infers quantity from repeat detections. It reports distinct codes; you set
-the quantity in the review step. This is also what stops a stray frame from
-silently double-consuming.
+## Day-to-day (phone / tablet)
 
-### Scanning is done in the browser
+The storeroom name leads the screen, with counts, below-minimum and
+expiring-soon totals under it.
 
-`components/live_scanner/index.html` streams the camera and decodes with
-[ZXing](https://github.com/zxing-js/library) client-side, as a small custom
-Streamlit component (the component protocol is implemented directly over
-`postMessage`, so there is no npm build step).
+| Screen | What it does |
+|---|---|
+| **Add Stock** | Batch-scan items in. Set the expiry before scanning; a GS1 pharma code that carries its own expiry overrides it per item. Stocking an expiry already on the shelf **adds to that count** rather than creating a second batch. |
+| **Withdraw** | Batch-scan items out, oldest expiry first. Shows a large confirmation listing what went, with the expiry taken. |
+| **Transfer** | Send stock to another storeroom in the agency, chosen by typing to filter. Expiry dates travel with it. The destination must already carry the item. |
+| **Dispose** | Scan or select an item, pick the batch, give a reason. **This one does confirm** — it is the only action with no counterpart record to reconcile against. |
+| **Activity** | Every movement: inflow/outflow, item, quantity, the expiry that moved, disposal reason, the other storeroom, and who. |
+| **Inventory / Low Stock / Expiry** | Current counts, anything below its minimum, and dated stock soonest-first. |
 
-It drives the capture→decode loop itself rather than calling ZXing's
-`BrowserMultiFormatReader.decodeFromConstraints()`. Measured against a fake
-camera feeding real barcodes, ZXing's own continuous scanner managed about one
-decode per ninety attempts; the hand-rolled loop hits every frame. Two reasons
-it loses so much: for video sources it auto-inverts every second frame (half the
-attempts hunting a white-on-black code that isn't there), and the rest go
-through `decodeWithState`, which fared far worse than `decode(bitmap, hints)`.
+## Admin (desktop)
 
-A decode also returns at most **one** barcode, so the loop scans the full frame
-plus a rotating pair of overlapping tiles. That is what lets a basket of items
-register several codes instead of reporting the same one forever. Tile overlap
-(a third of the frame) exceeds a label's width on purpose — a barcode only
-decodes if it falls entirely inside one tile.
+- **Storerooms** — create them, then per storeroom: **Users Assigned**
+  (assign/unassign/delete), **Inventory Assigned** (assign master items with a
+  min and opening quantity; an item with stock on hand **cannot** be unassigned;
+  correct counts here), **Webhook**, and rename/delete.
+- **Master Inventory** — the agency's item list: name, barcode, and a unit of
+  measure from the standard set (UN/ECE Rec 20, the list GS1 uses). CSV upload
+  for an existing list. Shows which storerooms carry each item.
+- **Users** — three roles:
 
-Doing it this way means:
+| Role | Can do |
+|---|---|
+| **App Admin** | Everything, plus manage inventory, storerooms, users, webhooks |
+| **Team Admin** | Everything a User can, plus **Dispose** and **Transfer** |
+| **User** | Add Stock, Withdraw, Activity, Inventory, Low Stock, Expiry |
 
-- Camera frames never reach the server.
-- No WebRTC/TURN traversal, which is what makes `streamlit-webrtc` unreliable on
-  Community Cloud.
-- No OpenCV on the server at all — hence its absence from `requirements.txt`.
-- DataMatrix works out of the box; the old `pylibdmtx`/`libdmtx` requirement is gone.
+### Webhooks
 
-Two things it needs: **HTTPS** (browsers only grant camera access over HTTPS or
-on `localhost`, so a `http://192.168.x.x` LAN address will not work), and access
-to `unpkg.com` for the ZXing library. If the network blocks CDNs, vendor ZXing
-into the repo and change the `<script src>`. Both flows also have a
-**type-the-code-by-hand** fallback, which is why the label prints the code in text.
+Each storeroom can hold a webhook URL, and the payload covers both wanted
+triggers: items expiring inside a horizon (a month by default) and anything below
+its minimum. There is a **Send now** button to test it.
+
+**This app cannot schedule anything.** Streamlit only runs while a browser
+session is open, so the monthly and low-stock reports must come from an external
+scheduler (Plumber, cron, a CI job) calling in. The payload preview shows what to
+expect.
+
+## Measured behaviour
+
+Verified by feeding rendered barcodes to headless Chrome as a fake camera and
+running the real component:
+
+| Scene | Result |
+|---|---|
+| Single Code128 / EAN-13 / QR, 35–80% of frame | exact, first decode ~15ms |
+| 3 distinct codes in frame | 3/3 |
+| Mixed EAN-13 + Code128 + GS1-QR + Code128 | 4/4 |
+| 3 **identical** codes + 1 distinct | 3 and 1 — exact |
+| 12 items (4 products × 3 copies), 1080p | 12/12, ~9s of scanning |
+
+**The limit is optical, not algorithmic.** A barcode needs roughly 2px per narrow
+bar to decode; below that nothing helps. A 4×5 grid of 11-character Code128
+symbols in a 720p frame works out at ~1.5px per bar and is simply unreadable —
+that scene counted 10–14 of 20. At 4.4px per bar it counts exactly. Practically:
+**spread items out, fill the frame, and scan in batches of roughly a dozen**
+rather than tipping 100 items under the camera at once. On those numbers 100
+items lands inside two minutes across several batches.
 
 ## Run locally
 
 ```bash
 python3 -m venv venv
 source venv/bin/activate
-pip install -r requirements-local.txt      # full local set (incl. vision POC)
-streamlit run inventory_app.py             # the inventory app
-# or: streamlit run app.py                 # the AI-vision POC (needs ANTHROPIC_API_KEY)
+pip install -r requirements-local.txt
+streamlit run inventory_app.py
 ```
 
 Use the **localhost** URL for camera testing. For a phone, deploy and use the
-HTTPS URL — the LAN address won't get camera permission.
+HTTPS URL — browsers only grant camera access over HTTPS or on `localhost`, so a
+`http://192.168.x.x` LAN address will not work.
+
+First run offers to create an App Admin, or to **load a small demo setup** (two
+storerooms, three users covering every role, five items with stock).
 
 ## Deploy (Streamlit Community Cloud)
 
 1. Push to GitHub.
-2. https://share.streamlit.io → **Create app** → pick this repo. For a private
-   repo you must grant Streamlit the extra GitHub permission, or it won't appear.
+2. share.streamlit.io → **Create app** → pick this repo. A private repo needs the
+   extra GitHub permission granted, or it will not appear.
 3. **Main file path**: `inventory_app.py`
 4. Deploy. `requirements.txt` is installed; no system packages needed.
 
-### Honest caveats for the hosted version
+### Honest caveats
 
-- **The app is public even if the repo is private.** A Community Cloud URL is
-  reachable by anyone who has it, and this app has no login — so anyone with the
-  link can read *and change* stock. Restrict viewers to invited emails before
-  this holds anything real.
-- **Storage is ephemeral.** `store.db` (SQLite) resets when the app sleeps or
-  redeploys. It's a demo store, not a lasting one — a real deployment needs an
-  external database.
-- **Inventory data is processed on Streamlit's servers.** Camera frames are not
-  (they stay in the browser), but item names, counts and expiry dates are. Fine
-  for desk-item testing; needs a proper review before any real ward or patient data.
+- **There is no authentication.** The sidebar picks who you are acting as, which
+  demonstrates the three roles but is not a login. Anyone with the URL can act as
+  anyone, including App Admin.
+- **A Community Cloud app is public even from a private repo.** Restrict viewers
+  to invited emails before this holds anything real.
+- **Storage is ephemeral.** `ward.db` (SQLite) resets when the app sleeps or
+  redeploys. A real deployment needs an external database.
+- **Camera frames stay on the device** — decoding is client-side. Item names,
+  counts and expiry dates are processed on Streamlit's servers.
+- The scanner fetches ZXing from `unpkg.com`. If the network blocks CDNs it says
+  so rather than failing silently; vendoring the library is a small change.
 
 ## Barcode support
 
 | Type | Identity + count | Expiry from scan |
 |---|---|---|
-| 1D retail (EAN/UPC) | ✅ | typed in manually |
-| Code128 (incl. generated `WARD-` labels) | ✅ | typed in manually |
+| 1D retail (EAN/UPC) | ✅ | typed in per batch |
+| Code128 / Code39 / ITF / Codabar | ✅ | typed in per batch |
 | QR (incl. GS1-QR) | ✅ | ✅ if GS1-encoded |
 | GS1 DataMatrix (pharma) | ✅ | ✅ |
