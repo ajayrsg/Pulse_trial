@@ -13,8 +13,10 @@ import urllib.request
 import pandas as pd
 import streamlit as st
 
+import gs1
 import store_db as db
 import uom as uom_mod
+from live_scanner import live_scanner, take_batch
 
 WEBHOOK_TIMEOUT_S = 10
 
@@ -286,6 +288,108 @@ def storerooms(agency_id):
 CSV_TEMPLATE = "name,barcode,uom\nSyringe 5ml,5012345678900,EA\nGauze pad,5012345678901,PK\n"
 
 
+def _key(code):
+    """A widget-key-safe form of a barcode (they can carry GS1 separators)."""
+    return "".join(ch if ch.isalnum() else "_" for ch in code)[:28]
+
+
+def _scan_to_master(agency_id):
+    """Build the master list by holding items up to the camera.
+
+    Uses the same batch scanner as the ward screens, so a whole shelf can be
+    swept in one pass — each new code then just needs a name and a unit. A code
+    already in the list is called out rather than silently duplicated.
+    """
+    st.caption(
+        "Hold the barcodes up to the camera. Several at once is fine — every new "
+        "code gets its own row below to name."
+    )
+
+    value = live_scanner(key="scan_master", mode="master")
+    batch = take_batch(value, "mi_last_batch")
+
+    queue = st.session_state.setdefault("mi_queue", [])
+    if batch:
+        for entry in batch["items"]:
+            # A GS1 code carries its GTIN plus expiry/lot; the master list keys
+            # on the GTIN so a later scan of either form resolves to this item.
+            info = gs1.extract(entry["code"])
+            code = info["gtin"] or entry["code"]
+            if not any(q["code"] == code for q in queue):
+                queue.append({"code": code, "format": entry.get("format", "")})
+
+    if not queue:
+        st.info("Press **Start scanning**, then hold a barcode up to the camera.")
+        return
+
+    if st.button("Clear scanned list", key="mi_clear_q"):
+        st.session_state["mi_queue"] = []
+        st.rerun()
+
+    codes = uom_mod.codes()
+    for q in list(queue):
+        code = q["code"]
+        k = _key(code)
+        existing = db.item_by_barcode(agency_id, code)
+        with st.container(border=True):
+            st.write(f"**Barcode:** `{code}`"
+                     + (f"  ·  {q['format']}" if q.get("format") else ""))
+            if existing:
+                st.info(
+                    f"Already in the master list as **{existing['name']}** "
+                    f"({existing['uom']}). Nothing to do."
+                )
+                if st.button("Dismiss", key=f"mi_dis_{k}"):
+                    st.session_state["mi_queue"] = [
+                        x for x in st.session_state["mi_queue"] if x["code"] != code
+                    ]
+                    st.rerun()
+            else:
+                with st.form(f"mi_add_{k}"):
+                    nm = st.text_input("Item name")
+                    uu = st.selectbox(
+                        "Unit of measure", codes, format_func=uom_mod.display,
+                        index=codes.index(uom_mod.DEFAULT_UOM),
+                    )
+                    if st.form_submit_button("Add to master list", type="primary"):
+                        if not nm.strip():
+                            st.error("Give the item a name.")
+                        else:
+                            db.create_item(agency_id, nm.strip(), code, uu)
+                            st.session_state["mi_queue"] = [
+                                x for x in st.session_state["mi_queue"]
+                                if x["code"] != code
+                            ]
+                            st.success(f"Added {nm.strip()}.")
+                            st.rerun()
+                if st.button("Skip this one", key=f"mi_skip_{k}"):
+                    st.session_state["mi_queue"] = [
+                        x for x in st.session_state["mi_queue"] if x["code"] != code
+                    ]
+                    st.rerun()
+
+
+def _type_to_master(agency_id):
+    with st.form("new_item"):
+        name = st.text_input("Item name")
+        barcode = st.text_input("Barcode",
+                                placeholder="the code printed on the pack")
+        u = st.selectbox("Unit of measure", uom_mod.codes(),
+                         format_func=uom_mod.display,
+                         index=uom_mod.codes().index(uom_mod.DEFAULT_UOM))
+        if st.form_submit_button("Add to master list", type="primary"):
+            if not name.strip():
+                st.error("Give the item a name.")
+            elif not barcode.strip():
+                st.error("A barcode is required — it is how the scanner finds the item.")
+            elif db.item_by_barcode(agency_id, barcode.strip()):
+                st.error(f"Barcode `{barcode.strip()}` is already in the list.")
+            else:
+                db.create_item(agency_id, name, barcode, u)
+                st.success(f"Added {name.strip()}.")
+                st.rerun()
+
+
 def master_inventory(agency_id):
     st.subheader("📋 Master Inventory List")
     st.caption(
@@ -294,23 +398,15 @@ def master_inventory(agency_id):
     )
 
     with st.expander("➕ Add an item", expanded=False):
-        with st.form("new_item"):
-            name = st.text_input("Item name")
-            barcode = st.text_input("Barcode", placeholder="scan or type the code on the pack")
-            u = st.selectbox("Unit of measure", uom_mod.codes(),
-                             format_func=uom_mod.display,
-                             index=uom_mod.codes().index(uom_mod.DEFAULT_UOM))
-            if st.form_submit_button("Add to master list", type="primary"):
-                if not name.strip():
-                    st.error("Give the item a name.")
-                elif not barcode.strip():
-                    st.error("A barcode is required — it is how the scanner finds the item.")
-                elif db.item_by_barcode(agency_id, barcode.strip()):
-                    st.error(f"Barcode `{barcode.strip()}` is already in the list.")
-                else:
-                    db.create_item(agency_id, name, barcode, u)
-                    st.success(f"Added {name.strip()}.")
-                    st.rerun()
+        how = st.radio(
+            "Where does the barcode come from?",
+            ["📷 Scan it", "⌨️ Type it"],
+            horizontal=True, key="mi_how",
+        )
+        if how.startswith("📷"):
+            _scan_to_master(agency_id)
+        else:
+            _type_to_master(agency_id)
 
     with st.expander("⬆️ Upload an existing list (CSV)", expanded=False):
         st.caption("Columns: `name`, `barcode`, `uom`. Unknown UOM codes fall back to EA.")

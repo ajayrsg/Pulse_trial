@@ -73,8 +73,13 @@ designed on light surfaces, so a viewer's dark mode would otherwise wreck them.
   min and opening quantity; an item with stock on hand **cannot** be unassigned;
   correct counts here), **Webhook**, and rename/delete.
 - **Master Inventory** — the agency's item list: name, barcode, and a unit of
-  measure from the standard set (UN/ECE Rec 20, the list GS1 uses). CSV upload
-  for an existing list. Shows which storerooms carry each item.
+  measure from the standard set (UN/ECE Rec 20, the list GS1 uses). Three ways in:
+  **scan** the barcode with the camera (the same batch scanner, so a whole shelf
+  can be swept in one pass — each new code then just needs a name and a unit),
+  **type** it, or **upload a CSV**. A code already in the list is called out
+  rather than duplicated, and a GS1 pharma payload is stored as its GTIN so a
+  later scan of either form resolves to the same item. Shows which storerooms
+  carry each item.
 - **Users** — three roles:
 
 | Role | Can do |
