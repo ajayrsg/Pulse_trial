@@ -133,8 +133,12 @@ Use the **localhost** URL for camera testing. For a phone, deploy and use the
 HTTPS URL — browsers only grant camera access over HTTPS or on `localhost`, so a
 `http://192.168.x.x` LAN address will not work.
 
-First run offers to create an App Admin, or to **load a small demo setup** (two
-storerooms, three users covering every role, five items with stock).
+First run offers to create an App Admin, or to **load a demo setup** (two
+storerooms, users covering every role, six items with stock — including an
+out-of-stock item, an expired batch and two below their minimum, so every screen
+has something to show). The same demo shortcut sits in **Admin → Storerooms**
+while no storerooms exist, which matters on Community Cloud because the database
+resets when the app sleeps.
 
 ## Deploy (Streamlit Community Cloud)
 

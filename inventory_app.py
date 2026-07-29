@@ -22,6 +22,7 @@ the URL can act as anyone, so this must not hold real data as it stands.
 import streamlit as st
 
 import admin_ui
+import demo
 import ops_ui
 import store_db as db
 import ui_shell
@@ -69,46 +70,8 @@ def _bootstrap():
             "handful of items with stock — enough to exercise every screen."
         )
         if st.button("Load demo data"):
-            _seed_demo()
+            demo.seed(AGENCY_ID)
             st.rerun()
-
-
-def _seed_demo():
-    from datetime import date, timedelta
-
-    a = AGENCY_ID
-    r1 = db.create_storeroom(a, "Ward 5A Store")
-    r2 = db.create_storeroom(a, "Ward 7B Store")
-
-    admin = db.create_user(a, "Admin (demo)", db.ROLE_APP_ADMIN)
-    lead = db.create_user(a, "Team Admin (demo)", db.ROLE_TEAM_ADMIN)
-    nurse = db.create_user(a, "Nurse (demo)", db.ROLE_USER)
-    for u in (admin, lead, nurse):
-        db.assign_user(u, r1)
-    db.assign_user(admin, r2)
-    db.assign_user(lead, r2)
-
-    soon = (date.today() + timedelta(days=20)).isoformat()
-    later = (date.today() + timedelta(days=400)).isoformat()
-    gone = (date.today() - timedelta(days=7)).isoformat()
-
-    spec = [
-        ("Syringe 5ml", "5012345678900", "EA", 20, [(30, soon), (25, later)]),
-        ("Nitrile glove M", "5012345678901", "BX", 5, [(2, None)]),
-        ("Gauze pad", "5012345678902", "PK", 10, [(12, later), (4, gone)]),
-        ("Saline 0.9% 500ml", "5012345678903", "BO", 8, [(9, soon)]),
-        ("Micropore tape", "5012345678904", "RL", 4, [(1, None)]),
-        ("Cannula 20G", "5012345678905", "EA", 6, []),      # assigned, no stock
-    ]
-    for name, bc, u, minq, lots in spec:
-        iid = db.create_item(a, name, bc, u)
-        db.assign_item(r1, iid, min_qty=minq)
-        for qty, exp in lots:
-            db.stock_in(r1, iid, qty, exp, user_id=nurse)
-        db.assign_item(r2, iid, min_qty=max(1, minq // 2))
-
-    db.stock_in(r2, db.item_by_barcode(a, "5012345678900")["id"], 5, soon, user_id=nurse)
-    db.withdraw(r1, db.item_by_barcode(a, "5012345678900")["id"], 6, user_id=nurse)
 
 
 people = db.list_users(AGENCY_ID)

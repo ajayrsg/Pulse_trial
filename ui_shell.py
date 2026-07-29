@@ -178,25 +178,53 @@ def store_header(room):
     st.markdown(f'<div class="store-name">{name}</div>', unsafe_allow_html=True)
 
 
+def _get_started(user):
+    """Shown when there is no storeroom to act on.
+
+    Without this the page dead-ends: the Admin link used to sit below the
+    inventory overview, which is only reached when a storeroom exists — so a
+    fresh App Admin had no way to create their first one.
+    """
+    can_admin = db.can(user["role"], "manage_storerooms")
+    st.markdown('<div class="sec-title">Get started</div>', unsafe_allow_html=True)
+
+    if not can_admin:
+        st.warning(
+            "You are not assigned to a storeroom yet. An App Admin needs to "
+            "assign you before you can add or withdraw stock."
+        )
+        return
+
+    st.markdown(
+        _link("admin", "Open Admin  ↗", "wide-link"),
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Three steps: create a storeroom, build the master inventory list "
+        "(scan, type or upload a CSV), then assign items to the storeroom."
+    )
+    st.caption(
+        "Admin also has a one-click demo setup if you would rather look around "
+        "with data already in place."
+    )
+
+
 def landing(agency_id, room, user):
     """Quick actions, then the inventory overview."""
-    st.markdown('<div class="sec-title">Quick actions</div>', unsafe_allow_html=True)
-
     if room is None:
-        st.info("No storeroom selected yet.")
-    else:
-        cards = "".join(
-            _link(nav, f'<span class="ic">{icon}</span><span class="lb">{label}</span>',
-                  "qa-card")
-            for nav, label, icon, cap in QUICK_ACTIONS
-            if db.can(user["role"], cap)
-        )
-        st.markdown(f'<div class="qa-grid">{cards}</div>', unsafe_allow_html=True)
+        _get_started(user)
+        return
+
+    st.markdown('<div class="sec-title">Quick actions</div>', unsafe_allow_html=True)
+    cards = "".join(
+        _link(nav, f'<span class="ic">{icon}</span><span class="lb">{label}</span>',
+              "qa-card")
+        for nav, label, icon, cap in QUICK_ACTIONS
+        if db.can(user["role"], cap)
+    )
+    st.markdown(f'<div class="qa-grid">{cards}</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="sec-title">Inventory overview</div>', unsafe_allow_html=True)
-    if room is None:
-        st.caption("Pick a storeroom in the sidebar.")
-        return
 
     rows = db.storeroom_items(room["id"])
     in_stock = sum(1 for r in rows if r["on_hand"] > 0)

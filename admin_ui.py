@@ -13,6 +13,7 @@ import urllib.request
 import pandas as pd
 import streamlit as st
 
+import demo
 import gs1
 import store_db as db
 import uom as uom_mod
@@ -46,6 +47,18 @@ def storerooms(agency_id):
     rooms = db.list_storerooms(agency_id)
     if not rooms:
         st.info("No storerooms yet. Create one above.")
+        st.divider()
+        st.markdown("**…or load a demo setup**")
+        st.caption(
+            "Two storerooms, users covering all three roles, and six items with "
+            "stock — including an expired batch and something below its minimum, "
+            "so every screen has something to show. Everyone already in the "
+            "agency is assigned to both storerooms."
+        )
+        if st.button("Load demo data", key="ad_seed"):
+            demo.seed(agency_id, keep_existing_users=True)
+            st.success("Demo data loaded.")
+            st.rerun()
         return
 
     st.dataframe(
