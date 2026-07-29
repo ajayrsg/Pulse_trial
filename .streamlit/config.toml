@@ -1,0 +1,12 @@
+# The landing page is designed light — the action cards and the stock-status
+# ring use light surfaces with dark text. Pin the theme so it looks the same
+# regardless of the viewer's OS or browser preference.
+[theme]
+base = "light"
+primaryColor = "#A8741A"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F7F7F8"
+textColor = "#14161A"
+
+[browser]
+gatherUsageStats = false

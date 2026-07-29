@@ -355,6 +355,72 @@ def dispose(agency_id, room, user):
 
 
 # ==========================================================================
+# Stock take
+# ==========================================================================
+def stock_take(agency_id, room, user):
+    st.subheader("📋 Stock take")
+    st.caption(
+        "Count what is actually on the shelf and correct the record. Add Stock "
+        "and Withdraw post straight from the camera without anyone confirming "
+        "them, so this is where a count that came out wrong gets fixed."
+    )
+
+    rows = [r for r in db.storeroom_items(room["id"])]
+    if not rows:
+        st.info("No items assigned to this storeroom.")
+        return
+
+    labels = [f"{r['name']} — {r['on_hand']} {r['uom']} on record" for r in rows]
+    pick = st.selectbox("Item", labels, key="st_item")
+    row = rows[labels.index(pick)]
+
+    lots = db.batches(room["id"], row["item_id"], with_zero=True)
+    if not lots:
+        st.info(f"No batches recorded for {row['name']}. Use **Stock up** to add some.")
+        return
+
+    st.markdown("**Recorded batches**")
+    st.dataframe(
+        pd.DataFrame([{
+            "Expiry": _fmt_expiry(b["expiry"]),
+            "On record": b["quantity"],
+            "Last touched": b["updated_at"].replace("T", " "),
+        } for b in lots]),
+        width="stretch", hide_index=True,
+    )
+
+    llabels = [f"{_fmt_expiry(b['expiry'])} — {b['quantity']} on record" for b in lots]
+    lp = st.selectbox("Which batch did you count?", llabels, key="st_lot")
+    lot = lots[llabels.index(lp)]
+
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        counted = st.number_input("Counted on the shelf", min_value=0,
+                                  value=int(lot["quantity"]), step=1, key="st_qty")
+    with c2:
+        note = st.text_input("Note", key="st_note",
+                             placeholder="e.g. scanner undercounted a basket")
+
+    delta = int(counted) - int(lot["quantity"])
+    if delta == 0:
+        st.info("Matches the record — nothing to correct.")
+    else:
+        word = "more" if delta > 0 else "fewer"
+        st.warning(
+            f"**{abs(delta)} {word}** on the shelf than recorded "
+            f"({lot['quantity']} → {counted}). Saving logs an adjustment."
+        )
+
+    if st.button("Save count", type="primary", key="st_go", disabled=(delta == 0)):
+        applied = db.adjust_batch(
+            room["id"], row["item_id"], lot["expiry"], int(counted),
+            user_id=user["id"], reason=(note.strip() or "stock take"),
+        )
+        st.success(f"### ✓ Corrected {row['name']} by {applied:+d}")
+        st.caption(f"Now {db.on_hand(room['id'], row['item_id'])} on record.")
+
+
+# ==========================================================================
 # Inventory / Low stock / Expiry
 # ==========================================================================
 def inventory(agency_id, room, user):

@@ -2,12 +2,14 @@
 
 Run:  streamlit run inventory_app.py
 
-Two audiences:
+Opens on a landing page: quick action cards, then an inventory overview. Picking
+an action navigates to that single screen, so a nurse sees a short list of
+choices and then one job at a time rather than a row of tabs.
 
-  Day-to-day (phone / tablet) — Add Stock and Withdraw are driven by the batch
+  Day-to-day (phone / tablet) — Stock up and Withdraw are driven by the batch
   scanner: tip items under the camera and everything is counted at once, with no
-  per-item tap and no confirm step. Plus Activity, Inventory, Low Stock, Expiry,
-  and — for Team Admins — Transfer and Dispose.
+  per-item tap and no confirm step. Team Admins also get Transfer, Dispose and
+  Stock take.
 
   Admin (desktop) — build the master inventory list, create storerooms, assign
   items and people to them, and set the webhook a scheduler calls.
@@ -22,13 +24,29 @@ import streamlit as st
 import admin_ui
 import ops_ui
 import store_db as db
+import ui_shell
 
-st.set_page_config(page_title="Ward Store", layout="wide")
+st.set_page_config(page_title="Ward Store", layout="centered",
+                   initial_sidebar_state="collapsed")
 
 AGENCY_ID = db.ensure_agency()
+ui_shell.inject_css()
+
+# nav key -> (capability, title, renderer)
+SCREENS = {
+    "withdraw":   ("withdraw",   "Withdraw",    ops_ui.withdraw),
+    "stock_up":   ("add_stock",  "Stock up",    ops_ui.add_stock),
+    "stock_take": ("stock_take", "Stock take",  ops_ui.stock_take),
+    "transfer":   ("transfer",   "Transfer",    ops_ui.transfer),
+    "dispose":    ("dispose",    "Dispose",     ops_ui.dispose),
+    "activity":   ("activity",   "Activity",    ops_ui.activity),
+    "inventory":  ("inventory",  "Inventory",   ops_ui.inventory),
+    "low_stock":  ("low_stock",  "Low stock",   ops_ui.low_stock),
+    "expiry":     ("expiry",     "Expiry",      ops_ui.expiry),
+}
 
 
-def _bootstrap_notice():
+def _bootstrap():
     """First run has no users, so nobody could act as an App Admin."""
     st.title("🏥 Ward Store")
     st.info(
@@ -36,7 +54,7 @@ def _bootstrap_notice():
         "they build the master inventory list, the storerooms, and everyone else."
     )
     with st.form("first_admin"):
-        name = st.text_input("Your name", value="")
+        name = st.text_input("Your name")
         email = st.text_input("Email (optional)")
         if st.form_submit_button("Create App Admin", type="primary"):
             if not name.strip():
@@ -80,6 +98,7 @@ def _seed_demo():
         ("Gauze pad", "5012345678902", "PK", 10, [(12, later), (4, gone)]),
         ("Saline 0.9% 500ml", "5012345678903", "BO", 8, [(9, soon)]),
         ("Micropore tape", "5012345678904", "RL", 4, [(1, None)]),
+        ("Cannula 20G", "5012345678905", "EA", 6, []),      # assigned, no stock
     ]
     for name, bc, u, minq, lots in spec:
         iid = db.create_item(a, name, bc, u)
@@ -94,7 +113,7 @@ def _seed_demo():
 
 people = db.list_users(AGENCY_ID)
 if not people:
-    _bootstrap_notice()
+    _bootstrap()
     st.stop()
 
 # --------------------------------------------------------------------------
@@ -108,7 +127,8 @@ with st.sidebar:
     st.caption("No login — this switcher stands in for authentication.")
 
     is_app_admin = user["role"] == db.ROLE_APP_ADMIN
-    rooms = db.list_storerooms(AGENCY_ID) if is_app_admin else db.storerooms_for_user(user["id"])
+    rooms = (db.list_storerooms(AGENCY_ID) if is_app_admin
+             else db.storerooms_for_user(user["id"]))
 
     st.divider()
     st.markdown("### Storeroom")
@@ -128,64 +148,44 @@ with st.sidebar:
     st.caption(f"Agency: {agency['name'] if agency else '—'}")
 
 # --------------------------------------------------------------------------
-# Header — the storeroom name leads, per the spec
+# Route on the nav query parameter
 # --------------------------------------------------------------------------
-if room:
-    st.title(f"🏥 {room['name']}")
-    counts = db.storeroom_items(room["id"])
-    low = [c for c in counts if c["below_min"]]
-    exp = db.expiring(room["id"], within_days=ops_ui.EXPIRY_WARN_DAYS)
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Items", len(counts))
-    m2.metric("Units on hand", sum(c["on_hand"] for c in counts))
-    m3.metric("Below minimum", len(low))
-    m4.metric(f"Expiring ≤{ops_ui.EXPIRY_WARN_DAYS}d", len(exp))
-else:
-    st.title("🏥 Ward Store")
+nav = (st.query_params.get("nav") or "").strip()
+
+# Header: the storeroom name leads, per the spec.
+ui_shell.store_header(room)
+if not room and not st.session_state.get("_warned"):
     if user["role"] == db.ROLE_APP_ADMIN:
-        st.info("No storerooms yet — create one under **Admin → Storerooms**.")
+        st.info("No storerooms yet — open **Admin** below to create one.")
     else:
         st.warning("You are not assigned to any storeroom. Ask an App Admin to assign you.")
 
-# --------------------------------------------------------------------------
-# Sections, gated by role
-# --------------------------------------------------------------------------
-SECTIONS = [
-    ("add_stock", "➕ Add Stock", ops_ui.add_stock),
-    ("withdraw", "➖ Withdraw", ops_ui.withdraw),
-    ("transfer", "🔁 Transfer", ops_ui.transfer),
-    ("dispose", "🗑 Dispose", ops_ui.dispose),
-    ("activity", "🧾 Activity", ops_ui.activity),
-    ("inventory", "📦 Inventory", ops_ui.inventory),
-    ("low_stock", "⚠️ Low Stock", ops_ui.low_stock),
-    ("expiry", "⏰ Expiry", ops_ui.expiry),
-]
+if nav == "admin":
+    if not db.can(user["role"], "manage_storerooms"):
+        ui_shell.back_link()
+        st.error("Your role cannot manage storerooms, inventory or users.")
+    else:
+        ui_shell.back_link()
+        st.caption("Best used on a desktop screen.")
+        a_rooms, a_items, a_users = st.tabs(
+            ["🏬 Storerooms", "📋 Master Inventory", "👥 Users"]
+        )
+        with a_rooms:
+            admin_ui.storerooms(AGENCY_ID)
+        with a_items:
+            admin_ui.master_inventory(AGENCY_ID)
+        with a_users:
+            admin_ui.users(AGENCY_ID)
 
-allowed = [(cap, label, fn) for cap, label, fn in SECTIONS if db.can(user["role"], cap)]
-admin_caps = db.can(user["role"], "manage_storerooms")
+elif nav in SCREENS:
+    cap, title, render = SCREENS[nav]
+    ui_shell.back_link()
+    if not db.can(user["role"], cap):
+        st.error(f"**{title}** is not available to a {db.ROLES.get(user['role'])}.")
+    elif room is None:
+        st.info("Select a storeroom in the sidebar first.")
+    else:
+        render(AGENCY_ID, room, user)
 
-labels = [label for _, label, _ in allowed]
-if admin_caps:
-    labels = labels + ["🛠 Admin"]
-
-if room or admin_caps:
-    tabs = st.tabs(labels)
-    for i, (cap, label, fn) in enumerate(allowed):
-        with tabs[i]:
-            if room is None:
-                st.info("Select a storeroom first.")
-            else:
-                fn(AGENCY_ID, room, user)
-
-    if admin_caps:
-        with tabs[len(allowed)]:
-            st.caption("Best used on a desktop screen.")
-            a_rooms, a_items, a_users = st.tabs(
-                ["🏬 Storerooms", "📋 Master Inventory", "👥 Users"]
-            )
-            with a_rooms:
-                admin_ui.storerooms(AGENCY_ID)
-            with a_items:
-                admin_ui.master_inventory(AGENCY_ID)
-            with a_users:
-                admin_ui.users(AGENCY_ID)
+else:
+    ui_shell.landing(AGENCY_ID, room, user)

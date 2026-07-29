@@ -38,20 +38,31 @@ items would post twice. A **Next batch** button is there for when the items
 cannot be cleared from view.
 
 Because nothing is confirmed by a person, a wrong count needs somewhere to be
-fixed: **Admin → Storerooms → Inventory Assigned → Correct a count**, which logs
-an adjustment against the batch.
+fixed. Two places do it, both logging an adjustment: the **Stock take** screen,
+and **Admin → Storerooms → Inventory Assigned → Correct a count**.
 
 ## Day-to-day (phone / tablet)
 
-The storeroom name leads the screen, with counts, below-minimum and
-expiring-soon totals under it.
+The app opens on a **landing page**, not a row of tabs: the storeroom name, then
+**Quick actions** as cards, then an **Inventory overview** with a stock-status
+ring. Picking an action goes to that one screen with a back link, so a nurse sees
+a short list of choices and then one job at a time.
+
+Cards are real anchors driven by a `nav` query parameter rather than session
+state — that allows the card layout (icon above label, which a Streamlit button
+cannot do) and makes the browser's own back button work. Cards a role cannot use
+are not rendered, and hitting the URL directly is refused as well.
+
+The theme is pinned light in `.streamlit/config.toml`: the cards and ring are
+designed on light surfaces, so a viewer's dark mode would otherwise wreck them.
 
 | Screen | What it does |
 |---|---|
-| **Add Stock** | Batch-scan items in. Set the expiry before scanning; a GS1 pharma code that carries its own expiry overrides it per item. Stocking an expiry already on the shelf **adds to that count** rather than creating a second batch. |
+| **Stock up** | Batch-scan items in. Set the expiry before scanning; a GS1 pharma code that carries its own expiry overrides it per item. Stocking an expiry already on the shelf **adds to that count** rather than creating a second batch. |
 | **Withdraw** | Batch-scan items out, oldest expiry first. Shows a large confirmation listing what went, with the expiry taken. |
 | **Transfer** | Send stock to another storeroom in the agency, chosen by typing to filter. Expiry dates travel with it. The destination must already carry the item. |
 | **Dispose** | Scan or select an item, pick the batch, give a reason. **This one does confirm** — it is the only action with no counterpart record to reconcile against. |
+| **Stock take** | Count what is on the shelf and correct the record, logged as an adjustment. Team Admin and above, since it overrides recorded counts. |
 | **Activity** | Every movement: inflow/outflow, item, quantity, the expiry that moved, disposal reason, the other storeroom, and who. |
 | **Inventory / Low Stock / Expiry** | Current counts, anything below its minimum, and dated stock soonest-first. |
 
@@ -69,8 +80,8 @@ expiring-soon totals under it.
 | Role | Can do |
 |---|---|
 | **App Admin** | Everything, plus manage inventory, storerooms, users, webhooks |
-| **Team Admin** | Everything a User can, plus **Dispose** and **Transfer** |
-| **User** | Add Stock, Withdraw, Activity, Inventory, Low Stock, Expiry |
+| **Team Admin** | Everything a User can, plus **Dispose**, **Transfer** and **Stock take** |
+| **User** | Stock up, Withdraw, Activity, Inventory, Low Stock, Expiry |
 
 ### Webhooks
 

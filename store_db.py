@@ -42,7 +42,9 @@ ROLES = {
 _USER_CAPS = {
     "add_stock", "withdraw", "activity", "inventory", "low_stock", "expiry",
 }
-_TEAM_ADMIN_CAPS = _USER_CAPS | {"dispose", "transfer"}
+# Stock take overrides recorded counts, so it sits with the other supervisory
+# actions rather than with everyday add/withdraw.
+_TEAM_ADMIN_CAPS = _USER_CAPS | {"dispose", "transfer", "stock_take"}
 _APP_ADMIN_CAPS = _TEAM_ADMIN_CAPS | {
     "manage_items", "manage_storerooms", "manage_users", "manage_webhooks",
 }
